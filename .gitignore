@@ -1,0 +1,55 @@
+# Rust
+debug/
+target/
+**/*.rs.bk
+*.pdb
+**/mutants.out*/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# Spark
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Delta Lake
+delta_output/
+_delta_log/
+checkpoints/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+*.duckdb
+*.duckdb.wal
+
+# Debug / troubleshooting output
+*_out.txt
+docker_*.txt
+pull_*.txt
+img.txt
+
+# Data (large generated files)
+*.parquet
+*.snappy

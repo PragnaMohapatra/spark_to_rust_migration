@@ -1,0 +1,60 @@
+# ──────────────────────────────────────────────────────────────
+# Spark-to-Rust Migration — Pipeline Configuration
+# ──────────────────────────────────────────────────────────────
+
+kafka:
+  bootstrap_servers: "localhost:9092"
+  topic: "financial_transactions"
+  account_topic: "account_updates"
+  partitions: 8
+  # For docker-internal Spark access use kafka:29092
+  internal_bootstrap_servers: "kafka:29092"
+
+generator:
+  # Target data volume per run (bytes). Default: 5 GB
+  target_bytes: 5368709120
+  # Records per Kafka produce batch
+  batch_size: 10000
+  # Number of parallel producer threads
+  num_threads: 4
+  # Estimated bytes per serialized record (~500 bytes avg)
+  avg_record_bytes: 500
+
+spark:
+  app_name: "FinancialTransactionsPipeline"
+  master: "spark://spark-master:7077"
+  # Structured streaming trigger interval
+  trigger_interval: "10 seconds"
+  # Checkpoint location inside container
+  checkpoint_location: "/opt/checkpoints/financial_txn"
+  # Delta table output path
+  delta_output_path: "/opt/delta_output/financial_transactions"
+  # Local-mode paths (for running outside Docker)
+  local_checkpoint: "./checkpoints/financial_txn"
+  local_delta_output: "./delta_output/financial_transactions"
+  # Spark tuning
+  shuffle_partitions: 8
+  max_offsets_per_trigger: 500000
+
+accounts:
+  # Number of accounts in the fixed pool
+  num_accounts: 2048
+  # Checkpoint location for account upsert stream
+  checkpoint_location: "/opt/checkpoints/account_upsert"
+  local_checkpoint: "./checkpoints/account_upsert"
+  # Delta table paths for the accounts table
+  delta_output_path: "/opt/delta_output/accounts"
+  local_delta_output: "./delta_output/accounts"
+
+delta:
+  # Default table path for viewer / cleanup (local mode)
+  table_path: "./delta_output/financial_transactions"
+  accounts_table_path: "./delta_output/accounts"
+  # Vacuum retention (hours) — files older than this are eligible for deletion
+  vacuum_retention_hours: 168   # 7 days
+  # Compact threshold — number of files before triggering compaction
+  compact_threshold: 50
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
