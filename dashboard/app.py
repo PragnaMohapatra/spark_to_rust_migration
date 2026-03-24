@@ -453,19 +453,33 @@ elif page == "⚙️ Spark Jobs":
 
     def _stop_spark_job(name: str):
         """Stop a running Spark job by killing it in the Spark cluster and locally."""
-        # Kill the app via Spark Master REST API
+        # 1. Kill the app via Spark Master REST API
         try:
             cluster = get_spark_cluster_status()
             if cluster["reachable"]:
                 resp = requests.get("http://localhost:8080/json/", timeout=3)
                 for app in resp.json().get("activeapps", []):
-                    # Match by job name in the app name
                     app_name_lower = app["name"].lower()
                     if name.replace("_", "") in app_name_lower.replace("_", ""):
                         requests.post(f"http://localhost:8080/app/kill/?id={app['id']}", timeout=5)
         except Exception:
             pass
-        # Kill the local docker-exec process
+
+        # 2. Kill the spark-submit process *inside* the container.
+        #    The local subprocess is just a `docker exec` wrapper —
+        #    terminating it does NOT stop the JVM inside the container.
+        try:
+            script_name = SPARK_JOBS.get(name, {}).get("script", "").split("/")[-1]
+            if script_name:
+                subprocess.run(
+                    ["docker", "exec", "spark-master", "bash", "-c",
+                     f"pkill -f '{script_name}' || true"],
+                    timeout=10, capture_output=True,
+                )
+        except Exception:
+            pass
+
+        # 3. Kill the local docker-exec wrapper process
         proc = st.session_state.spark_processes.get(name)
         if proc and proc.poll() is None:
             proc.terminate()
