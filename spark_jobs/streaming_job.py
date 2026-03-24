@@ -32,6 +32,7 @@ Run locally:
 import argparse
 import logging
 import sys
+import time as _time
 
 import yaml
 from pyspark.sql import SparkSession
@@ -52,6 +53,14 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )
 logger = logging.getLogger("streaming_job")
+
+# ── Metrics integration (graceful if unavailable) ─────────────
+try:
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
+    from dashboard.metrics import update_spark_metrics
+    _HAS_METRICS = True
+except Exception:
+    _HAS_METRICS = False
 
 # ── Transaction JSON schema ───────────────────────────────────
 
@@ -184,42 +193,63 @@ def run_streaming_job(cfg: dict, local: bool):
         )
     )
 
-    # ── 3. Apply all inline transforms ────────────────────────
+    # ── 3 + 4. foreachBatch with instrumentation ────────────────
     #
-    # Spark concept: .transform(fn) lets you compose DataFrame
-    # transformations as reusable functions.  apply_all_transforms
-    # chains 7 transforms that add ~25 derived columns covering:
-    #
-    #   null_handling      → coalesce, na.fill defaults
-    #   time_dimensions    → year, month, day, hour, weekend, quarter
-    #   amount_features    → bucket, net_amount, fee_pct, log_amount
-    #   risk_features      → UDF risk_tier, risk_level, needs_review
-    #   geo_features       → cross_border, corridor, intra_bank
-    #   anonymized_columns → sha2 hashing, account masking, IP anonymize
-    #   session_features   → device_short_id, memo_length, row_id
-    #
-    # Each transform is defined in spark_jobs/transforms.py with
-    # detailed docstrings explaining the Spark concept it uses.
-    enriched_df = parsed_df.transform(apply_all_transforms)
+    # We use foreachBatch so we can measure the time spent on:
+    #   (a) apply_all_transforms — the enrichment / UDF phase
+    #   (b) the Delta write itself
+    # and report both to the metrics module for the dashboard.
 
-    # ── 4. Write to Delta Lake ────────────────────────────────
-    #
-    # Spark concepts:
-    #   - writeStream + format("delta") → streaming Delta sink
-    #   - append mode → new rows only (no updates/deletes)
-    #   - checkpointLocation → WAL for exactly-once guarantees
-    #   - mergeSchema → auto-evolve schema if new columns appear
-    #   - partitionBy → physical data layout for partition pruning
-    #   - trigger(processingTime=...) → micro-batch interval
+    def _process_batch(batch_df, batch_id):
+        if batch_df.rdd.isEmpty():
+            logger.info(f"Batch {batch_id}: empty, skipping")
+            return
+
+        # ── Transform phase ───────────────────────────────────
+        t0 = _time.perf_counter()
+        enriched = batch_df.transform(apply_all_transforms)
+        # Force materialisation so transform time is real
+        row_count = enriched.count()
+        t_transform = (_time.perf_counter() - t0) * 1000  # ms
+
+        # ── Delta write phase ─────────────────────────────────
+        t1 = _time.perf_counter()
+        (
+            enriched.write
+            .format("delta")
+            .mode("append")
+            .option("mergeSchema", "true")
+            .partitionBy("txn_year", "txn_month", "currency")
+            .save(delta_path)
+        )
+        t_write = (_time.perf_counter() - t1) * 1000  # ms
+        t_batch = t_transform + t_write
+
+        logger.info(
+            f"Batch {batch_id}: {row_count} rows | "
+            f"transform {t_transform:.0f} ms | "
+            f"delta_write {t_write:.0f} ms | "
+            f"total {t_batch:.0f} ms"
+        )
+
+        if _HAS_METRICS:
+            try:
+                update_spark_metrics(
+                    status="running",
+                    batch_duration_ms=t_batch,
+                    transform_time_ms=t_transform,
+                    delta_write_time_ms=t_write,
+                    rows_processed=row_count,
+                )
+            except Exception as exc:
+                logger.warning(f"Metrics update failed: {exc}")
+
     query = (
-        enriched_df.writeStream
-        .format("delta")
-        .outputMode("append")
+        parsed_df.writeStream
+        .foreachBatch(_process_batch)
         .option("checkpointLocation", checkpoint)
-        .option("mergeSchema", "true")
-        .partitionBy("txn_year", "txn_month", "currency")
         .trigger(processingTime=spark_cfg["trigger_interval"])
-        .start(delta_path)
+        .start()
     )
 
     logger.info("Streaming query started — waiting for termination...")

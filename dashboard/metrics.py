@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Optional
 
 import duckdb
+import math
 
 METRICS_DIR = Path(__file__).resolve().parent.parent / "logs"
 DB_PATH = METRICS_DIR / "pipeline_metrics.duckdb"
@@ -92,6 +93,7 @@ def _init_tables(conn: duckdb.DuckDBPyConnection):
             avg_transform_time_ms   DOUBLE  DEFAULT 0.0,
             avg_delta_write_time_ms DOUBLE  DEFAULT 0.0,
             last_batch_rows INTEGER DEFAULT 0,
+            first_update    DOUBLE,
             last_update     DOUBLE
         )
     """)
@@ -193,7 +195,8 @@ def reset_metrics():
             UPDATE spark_state SET
                 status='idle', micro_batches_completed=0, total_rows_processed=0,
                 avg_batch_duration_ms=0.0, avg_transform_time_ms=0.0,
-                avg_delta_write_time_ms=0.0, last_batch_rows=0, last_update=NULL
+                avg_delta_write_time_ms=0.0, last_batch_rows=0,
+                first_update=NULL, last_update=NULL
             WHERE id=1
         """)
         conn.execute("""
@@ -204,6 +207,18 @@ def reset_metrics():
             UPDATE pipeline_state SET end_to_end_latency_ms=0.0, last_update=NULL
             WHERE id=1
         """)
+
+
+def _nan_to_none(v):
+    """Convert numpy NaN (returned by DuckDB for NULL) to Python None."""
+    if v is None:
+        return None
+    try:
+        if math.isnan(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return v
 
 
 def get_metrics() -> dict:
@@ -224,13 +239,13 @@ def get_metrics() -> dict:
                 "num_files": int(row["num_files"]),
                 "row_count": int(row["row_count"]),
                 "size_bytes": int(row["size_bytes"]),
-                "last_update": row["last_update"],
+                "last_update": _nan_to_none(row["last_update"]),
             }
 
         return {
             "generator": {
                 "status": g["status"],
-                "start_time": g["start_time"],
+                "start_time": _nan_to_none(g["start_time"]),
                 "target_bytes": int(g["target_bytes"]),
                 "bytes_sent": int(g["bytes_sent"]),
                 "records_sent": int(g["records_sent"]),
@@ -242,7 +257,7 @@ def get_metrics() -> dict:
                 "batch_timings_ms": _timings_list(conn, "generator_timings", "batch_time"),
                 "publish_latencies_ms": _timings_list(conn, "generator_timings", "publish_latency"),
                 "errors": int(g["errors"]),
-                "last_update": g["last_update"],
+                "last_update": _nan_to_none(g["last_update"]),
             },
             "spark": {
                 "status": s["status"],
@@ -255,12 +270,13 @@ def get_metrics() -> dict:
                 "transform_times_ms": _timings_list(conn, "spark_timings", "transform_time"),
                 "delta_write_times_ms": _timings_list(conn, "spark_timings", "delta_write_time"),
                 "last_batch_rows": int(s["last_batch_rows"]),
-                "last_update": s["last_update"],
+                "first_update": _nan_to_none(s["first_update"]),
+                "last_update": _nan_to_none(s["last_update"]),
             },
             "delta": delta,
             "pipeline": {
                 "end_to_end_latency_ms": float(p["end_to_end_latency_ms"]),
-                "last_update": p["last_update"],
+                "last_update": _nan_to_none(p["last_update"]),
             },
         }
 
@@ -388,6 +404,9 @@ def update_spark_metrics(
             params.append(rows_processed)
 
         if sets:
+            # Set first_update on the very first metrics call
+            sets.append("first_update = COALESCE(first_update, ?)")
+            params.append(now)
             sets.append("last_update = ?")
             params.append(now)
             conn.execute(

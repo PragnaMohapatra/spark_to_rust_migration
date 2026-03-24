@@ -40,7 +40,8 @@ Thumbs.db
 
 # Logs
 *.log
-logs/
+logs/*
+!logs/*.html
 *.duckdb
 *.duckdb.wal
 
@@ -49,6 +50,9 @@ logs/
 docker_*.txt
 pull_*.txt
 img.txt
+
+# Downloaded JARs (Spark dependencies) — tracked for reproducible builds
+!jars/
 
 # Data (large generated files)
 *.parquet

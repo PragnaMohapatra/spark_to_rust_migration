@@ -35,6 +35,11 @@ spark:
   # Spark tuning
   shuffle_partitions: 8
   max_offsets_per_trigger: 500000
+  # Cluster resources (must match docker-compose.yml)
+  worker_cores: 4
+  worker_memory: "4g"
+  # Cost model reference (USD / core-hour, Azure HDInsight D4v2 on-demand)
+  cost_per_core_hour: 0.752
 
 accounts:
   # Number of accounts in the fixed pool

@@ -37,7 +37,7 @@ services:
       # Tuned for 5GB throughput
       KAFKA_MESSAGE_MAX_BYTES: 10485760          # 10MB max message
       KAFKA_REPLICA_FETCH_MAX_BYTES: 10485760
-      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_LOG_RETENTION_HOURS: 168
       KAFKA_LOG_SEGMENT_BYTES: 1073741824         # 1GB segments
       KAFKA_NUM_PARTITIONS: 8                     # 8 partitions for parallelism
     healthcheck:
@@ -61,7 +61,7 @@ services:
         --topic financial_transactions \
         --partitions 8 \
         --replication-factor 1 \
-        --config retention.ms=86400000 \
+        --config retention.ms=604800000 \
         --config max.message.bytes=10485760
 
       echo 'Creating Kafka topic: account_updates'
@@ -70,7 +70,7 @@ services:
         --topic account_updates \
         --partitions 8 \
         --replication-factor 1 \
-        --config retention.ms=86400000 \
+        --config retention.ms=604800000 \
         --config max.message.bytes=10485760 \
         --config cleanup.policy=compact
 
@@ -93,11 +93,16 @@ services:
     ports:
       - "8080:8080"
       - "7077:7077"
+      - "4040:4040"
+      - "4041:4041"
     volumes:
       - ./spark_jobs:/opt/spark-jobs
       - ./config:/opt/config
       - ./delta_output:/opt/delta_output
       - ./checkpoints:/opt/checkpoints
+      - ./dashboard:/opt/dashboard
+      - ./logs:/opt/logs
+      - ./jars:/opt/extra-jars
 
   spark-worker:
     image: apache/spark:3.5.1
@@ -115,6 +120,9 @@ services:
       - ./config:/opt/config
       - ./delta_output:/opt/delta_output
       - ./checkpoints:/opt/checkpoints
+      - ./dashboard:/opt/dashboard
+      - ./logs:/opt/logs
+      - ./jars:/opt/extra-jars
 
 volumes:
   delta_output:

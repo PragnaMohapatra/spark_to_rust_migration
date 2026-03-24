@@ -424,7 +424,14 @@ elif page == "⚙️ Spark Jobs":
         cmd = [
             "docker", "exec", "spark-master",
             "/opt/spark/bin/spark-submit",
-            "--packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,io.delta:delta-spark_2.12:3.1.0",
+            "--jars", ",".join([
+                "/opt/extra-jars/spark-sql-kafka-0-10_2.12-3.5.1.jar",
+                "/opt/extra-jars/spark-token-provider-kafka-0-10_2.12-3.5.1.jar",
+                "/opt/extra-jars/kafka-clients-3.4.1.jar",
+                "/opt/extra-jars/commons-pool2-2.11.1.jar",
+                "/opt/extra-jars/delta-spark_2.12-3.1.0.jar",
+                "/opt/extra-jars/delta-storage-3.1.0.jar",
+            ]),
             "--conf", "spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension",
             "--conf", "spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog",
             container_script,
@@ -566,6 +573,136 @@ elif page == "⚙️ Spark Jobs":
             st.success("All jobs stopped.")
             time.sleep(0.5)
             st.rerun()
+
+    # ── Pipeline Reset ────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🔄 Pipeline Reset")
+    st.markdown(
+        "Stop all running jobs, wipe checkpoint / Delta data, and "
+        "optionally restart ingestion from the beginning of the Kafka topics."
+    )
+
+    reset_tab1, reset_tab2, reset_tab3 = st.tabs([
+        "🗑️ Wipe Checkpoints & Restart",
+        "💣 Delete All Delta Files",
+        "☢️ Full Reset (Both)",
+    ])
+
+    # Gather paths from config
+    _ckpt_paths = [
+        ("Transactions checkpoint", Path(cfg["spark"].get("local_checkpoint", "./checkpoints/financial_txn"))),
+        ("Accounts checkpoint", Path(cfg["accounts"].get("local_checkpoint", "./checkpoints/account_upsert"))),
+    ]
+    _delta_paths = [
+        ("Transactions Delta", Path(cfg["delta"].get("table_path", "./delta_output/financial_transactions"))),
+        ("Accounts Delta", Path(cfg["delta"].get("accounts_table_path", "./delta_output/accounts"))),
+    ]
+
+    def _stop_all_jobs():
+        for key in SPARK_JOBS:
+            _stop_spark_job(key)
+
+    def _wipe_paths(paths: list[tuple[str, Path]]) -> list[str]:
+        import shutil
+        removed = []
+        for label, p in paths:
+            if p.exists():
+                shutil.rmtree(p)
+                removed.append(f"{label} (`{p}`)")
+        return removed
+
+    def _restart_streaming_jobs():
+        for key in ["streaming", "account_upsert"]:
+            _start_spark_job(key, SPARK_JOBS[key]["script"])
+
+    # ── Tab 1: Wipe Checkpoints & Restart ─────────────────
+    with reset_tab1:
+        st.info(
+            "This will **stop all running jobs**, delete checkpoint directories, "
+            "then restart the streaming jobs. They will re-read from the earliest "
+            "available Kafka offset."
+        )
+        existing_ckpts = [(l, p) for l, p in _ckpt_paths if p.exists()]
+        if existing_ckpts:
+            for label, p in existing_ckpts:
+                st.write(f"  - {label}: `{p}`")
+        else:
+            st.write("No checkpoint directories found on disk.")
+
+        ckpt_confirm = st.text_input(
+            "Type **WIPE CHECKPOINTS** to confirm", key="ckpt_confirm"
+        )
+        if st.button("🗑️ Wipe Checkpoints & Restart", key="btn_wipe_ckpt"):
+            if ckpt_confirm.strip() == "WIPE CHECKPOINTS":
+                _stop_all_jobs()
+                removed = _wipe_paths(_ckpt_paths)
+                if removed:
+                    st.success("Removed: " + ", ".join(removed))
+                else:
+                    st.info("No checkpoint directories to remove.")
+                _restart_streaming_jobs()
+                st.success("Streaming jobs restarted — ingestion will resume from earliest offset.")
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.error("Type exactly: `WIPE CHECKPOINTS`")
+
+    # ── Tab 2: Delete All Delta Files ─────────────────────
+    with reset_tab2:
+        st.warning(
+            "This will **stop all running jobs** and permanently delete all "
+            "Delta Lake table data. The tables will be empty until jobs re-create them."
+        )
+        existing_delta = [(l, p) for l, p in _delta_paths if p.exists()]
+        if existing_delta:
+            for label, p in existing_delta:
+                st.write(f"  - {label}: `{p}`")
+        else:
+            st.write("No Delta table directories found on disk.")
+
+        delta_confirm = st.text_input(
+            "Type **DELETE ALL DELTA** to confirm", key="delta_confirm"
+        )
+        if st.button("💣 Delete All Delta Files", key="btn_del_delta"):
+            if delta_confirm.strip() == "DELETE ALL DELTA":
+                _stop_all_jobs()
+                removed = _wipe_paths(_delta_paths)
+                if removed:
+                    st.success("Removed: " + ", ".join(removed))
+                else:
+                    st.info("No Delta directories to remove.")
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.error("Type exactly: `DELETE ALL DELTA`")
+
+    # ── Tab 3: Full Reset (checkpoints + delta + restart) ─
+    with reset_tab3:
+        st.error(
+            "⚠️ **Nuclear option** — stops all jobs, deletes **all** checkpoint "
+            "and Delta Lake data, resets metrics, then restarts ingestion from scratch."
+        )
+        full_confirm = st.text_input(
+            "Type **FULL RESET** to confirm", key="full_reset_confirm"
+        )
+        if st.button("☢️ Full Reset", key="btn_full_reset", type="secondary"):
+            if full_confirm.strip() == "FULL RESET":
+                _stop_all_jobs()
+                removed_ckpt = _wipe_paths(_ckpt_paths)
+                removed_delta = _wipe_paths(_delta_paths)
+                reset_metrics()
+                all_removed = removed_ckpt + removed_delta
+                if all_removed:
+                    st.success("Removed: " + ", ".join(all_removed))
+                else:
+                    st.info("Nothing to remove — directories were already clean.")
+                st.info("Metrics reset.")
+                _restart_streaming_jobs()
+                st.success("Streaming jobs restarted — full pipeline reset complete.")
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.error("Type exactly: `FULL RESET`")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -783,6 +920,50 @@ elif page == "📈 Performance":
     # ── Spark Performance ─────────────────────────────────
     st.subheader("⚡ Spark Streaming Performance")
 
+    # ── Cost & Runtime Summary ────────────────────────────
+    #
+    # Estimate compute cost based on cluster resources and
+    # wall-clock time.  Uses Azure HDInsight D4v2 pricing as
+    # a reference (~$0.752 / core-hour for on-demand Spark).
+    COST_PER_CORE_HOUR = float(cfg.get("spark", {}).get("cost_per_core_hour", 0.752))
+    WORKER_CORES = int(cfg.get("spark", {}).get("worker_cores", 4))
+    _mem_raw = cfg.get("spark", {}).get("worker_memory", "4g")
+    WORKER_MEMORY_GB = int(str(_mem_raw).lower().replace("g", "")) if isinstance(_mem_raw, str) else int(_mem_raw)
+
+    first_ts = spark.get("first_update")
+    last_ts = spark.get("last_update")
+    wall_clock_s = (last_ts - first_ts) if (first_ts and last_ts and last_ts > first_ts) else 0.0
+    wall_clock_hours = wall_clock_s / 3600.0
+    total_compute_hours = wall_clock_hours * WORKER_CORES
+    estimated_cost = total_compute_hours * COST_PER_CORE_HOUR
+
+    # Total time actually spent processing (sum of batch durations)
+    total_transform_ms = sum(spark["transform_times_ms"]) if spark["transform_times_ms"] else 0
+    total_write_ms = sum(spark["delta_write_times_ms"]) if spark["delta_write_times_ms"] else 0
+    total_processing_ms = sum(spark["batch_durations_ms"]) if spark["batch_durations_ms"] else 0
+
+    st.markdown("##### 💰 Compute Cost & Runtime")
+    cc1, cc2, cc3, cc4, cc5 = st.columns(5)
+    cc1.metric("Wall-Clock Time", fmt_duration(wall_clock_s) if wall_clock_s > 0 else "—")
+    cc2.metric("CPU Processing", fmt_duration(total_processing_ms / 1000))
+    cc3.metric("Cluster Cores", f"{WORKER_CORES}")
+    cc4.metric("Compute Hours", f"{total_compute_hours:.2f} hrs")
+    cc5.metric("Est. Cost", f"${estimated_cost:.3f}",
+               help=f"Based on {WORKER_CORES} cores × {wall_clock_hours:.2f} hrs × ${COST_PER_CORE_HOUR}/core-hr (Azure HDInsight D4v2 reference)")
+
+    if wall_clock_s > 0:
+        idle_s = max(0, wall_clock_s - (total_processing_ms / 1000))
+        util_pct = min(100.0, (total_processing_ms / 1000) / wall_clock_s * 100)
+        uc1, uc2, uc3 = st.columns(3)
+        uc1.metric("Cluster Utilization", f"{util_pct:.1f}%",
+                    help="% of wall-clock time spent actively processing batches")
+        uc2.metric("Idle Time", fmt_duration(idle_s))
+        uc3.metric("Cost / 1M Rows",
+                    f"${(estimated_cost / max(1, spark['total_rows_processed']) * 1_000_000):.4f}"
+                    if spark['total_rows_processed'] > 0 else "—")
+
+    st.markdown("")
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Micro-batches", f"{spark['micro_batches_completed']:,}")
     c2.metric("Avg Batch Duration", f"{spark['avg_batch_duration_ms']:.0f} ms")
@@ -827,6 +1008,27 @@ elif page == "📈 Performance":
             "Avg": [batch_s.mean(), transform_s.mean(), write_s.mean()],
         }).round(2)
         st.dataframe(spark_summary, use_container_width=True, hide_index=True)
+
+        # ── Transform vs Write Breakdown ──────────────────
+        st.markdown("")
+        st.markdown("##### ⏱️ Time Breakdown: Transform vs Delta Write")
+
+        # Build a per-batch breakdown DataFrame
+        n = min(len(spark["transform_times_ms"]), len(spark["delta_write_times_ms"]))
+        if n > 0:
+            breakdown_df = pd.DataFrame({
+                "Transform (ms)": spark["transform_times_ms"][:n],
+                "Delta Write (ms)": spark["delta_write_times_ms"][:n],
+            })
+            st.area_chart(breakdown_df, use_container_width=True)
+
+            # Totals
+            tc1, tc2, tc3 = st.columns(3)
+            tc1.metric("Total Transform Time", fmt_duration(total_transform_ms / 1000))
+            tc2.metric("Total Delta Write Time", fmt_duration(total_write_ms / 1000))
+            pct_transform = total_transform_ms / max(1, total_processing_ms) * 100
+            pct_write = total_write_ms / max(1, total_processing_ms) * 100
+            tc3.metric("Transform / Write Ratio", f"{pct_transform:.0f}% / {pct_write:.0f}%")
 
         st.metric("Total Rows Processed", f"{spark['total_rows_processed']:,}")
         st.metric("Last Batch Rows", f"{spark['last_batch_rows']:,}")

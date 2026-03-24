@@ -29,6 +29,8 @@ Run locally:
 
 import argparse
 import logging
+import sys
+import time as _time
 
 import yaml
 from delta.tables import DeltaTable
@@ -48,6 +50,14 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )
 logger = logging.getLogger("account_upsert")
+
+# ── Metrics integration (graceful if unavailable) ─────────────
+try:
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
+    from dashboard.metrics import update_spark_metrics
+    _HAS_METRICS = True
+except Exception:
+    _HAS_METRICS = False
 
 # ── Account update event schema ───────────────────────────────
 
@@ -275,16 +285,41 @@ def run_account_upsert(cfg: dict, local: bool):
         .filter(F.col("account_id").isNotNull())
     )
 
-    # ── Write with foreachBatch → Delta MERGE ─────────────────
+    # ── Write with foreachBatch → Delta MERGE (instrumented) ──
     #
     # foreachBatch gives us access to each micro-batch as a static
     # DataFrame, which lets us call DeltaTable.merge() — something
     # not possible with a plain writeStream.format("delta").
+    # We wrap upsert_to_delta with timing instrumentation.
+
+    def _instrumented_upsert(df, bid):
+        if df.rdd.isEmpty():
+            logger.info(f"Batch {bid}: empty, skipping")
+            return
+        row_count = df.count()
+        t0 = _time.perf_counter()
+        upsert_to_delta(df, bid, delta_path, spark)
+        t_batch = (_time.perf_counter() - t0) * 1000  # ms
+
+        logger.info(
+            f"Batch {bid}: {row_count} rows | "
+            f"upsert {t_batch:.0f} ms"
+        )
+
+        if _HAS_METRICS:
+            try:
+                update_spark_metrics(
+                    status="running",
+                    batch_duration_ms=t_batch,
+                    delta_write_time_ms=t_batch,
+                    rows_processed=row_count,
+                )
+            except Exception as exc:
+                logger.warning(f"Metrics update failed: {exc}")
+
     query = (
         parsed_df.writeStream
-        .foreachBatch(
-            lambda df, bid: upsert_to_delta(df, bid, delta_path, spark)
-        )
+        .foreachBatch(_instrumented_upsert)
         .option("checkpointLocation", checkpoint)
         .trigger(processingTime=cfg["spark"]["trigger_interval"])
         .start()
