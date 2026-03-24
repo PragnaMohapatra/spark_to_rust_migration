@@ -303,6 +303,8 @@ def get_metrics() -> dict:
                 "last_batch_rows": spark_data.get("last_batch_rows", 0),
                 "first_update": spark_data.get("first_update"),
                 "last_update": spark_data.get("last_update"),
+                "batch_details": spark_data.get("batch_details", []),
+                "executor": spark_data.get("executor", {}),
             },
             "delta": delta,
             "pipeline": {

@@ -63,6 +63,18 @@ except Exception as exc:
     _HAS_METRICS = False
     logger.warning("Dashboard metrics unavailable: %s", exc)
 
+try:
+    from spark_metrics_collector import get_app_id, collect_batch_metrics
+    _HAS_COLLECTOR = True
+    logger.info("Spark REST API metrics collector enabled")
+except Exception as exc:
+    _HAS_COLLECTOR = False
+    logger.warning("Spark metrics collector unavailable: %s", exc)
+
+# Track the last known stage ID for per-batch delta calculations
+_last_stage_id = -1
+_spark_app_id = None
+
 # ── Transaction JSON schema ───────────────────────────────────
 
 TRANSACTION_SCHEMA = StructType([
@@ -235,12 +247,49 @@ def run_streaming_job(cfg: dict, local: bool):
 
         if _HAS_METRICS:
             try:
+                batch_detail = None
+                executor_snapshot = None
+
+                # Collect detailed metrics from Spark REST API
+                if _HAS_COLLECTOR:
+                    global _spark_app_id, _last_stage_id
+                    if _spark_app_id is None:
+                        _spark_app_id = get_app_id()
+                    if _spark_app_id:
+                        api_data = collect_batch_metrics(_spark_app_id, _last_stage_id)
+                        if "stage" in api_data:
+                            stage = api_data["stage"]
+                            batch_detail = {
+                                "batch_id": batch_id,
+                                "rows": row_count,
+                                "wall_ms": round(t_batch, 1),
+                                "transform_ms": round(t_transform, 1),
+                                "write_ms": round(t_write, 1),
+                                "cpu_ms": stage.get("cpu_ms", 0),
+                                "gc_ms": stage.get("gc_ms", 0),
+                                "cpu_util_pct": stage.get("cpu_util_pct", 0),
+                                "gc_pct": stage.get("gc_pct", 0),
+                                "input_mb": stage.get("input_mb", 0),
+                                "output_mb": stage.get("output_mb", 0),
+                                "shuffle_read_mb": stage.get("shuffle_read_mb", 0),
+                                "shuffle_write_mb": stage.get("shuffle_write_mb", 0),
+                                "shuffle_read_records": stage.get("shuffle_read_records", 0),
+                                "shuffle_write_records": stage.get("shuffle_write_records", 0),
+                                "peak_memory_mb": stage.get("peak_execution_memory_mb", 0),
+                                "tasks": stage.get("tasks", 0),
+                            }
+                            _last_stage_id = stage.get("last_stage_id", _last_stage_id)
+                        if "executor" in api_data:
+                            executor_snapshot = api_data["executor"]
+
                 update_spark_metrics(
                     status="running",
                     batch_duration_ms=t_batch,
                     transform_time_ms=t_transform,
                     delta_write_time_ms=t_write,
                     rows_processed=row_count,
+                    batch_detail=batch_detail,
+                    executor_metrics=executor_snapshot,
                 )
             except Exception as exc:
                 logger.warning(f"Metrics update failed: {exc}")

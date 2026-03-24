@@ -44,6 +44,10 @@ def _load() -> dict:
         "batch_durations_ms": [],
         "transform_times_ms": [],
         "delta_write_times_ms": [],
+        # Per-batch detailed metrics (from Spark REST API)
+        "batch_details": [],
+        # Cumulative executor totals
+        "executor": {},
     }
 
 
@@ -71,6 +75,8 @@ def update_spark_metrics(
     transform_time_ms: Optional[float] = None,
     delta_write_time_ms: Optional[float] = None,
     rows_processed: Optional[int] = None,
+    batch_detail: Optional[dict] = None,
+    executor_metrics: Optional[dict] = None,
 ):
     """Append a micro-batch measurement to the shared JSON file."""
     data = _load()
@@ -99,6 +105,16 @@ def update_spark_metrics(
     if rows_processed is not None:
         data["total_rows_processed"] = data.get("total_rows_processed", 0) + rows_processed
         data["last_batch_rows"] = rows_processed
+
+    # Per-batch detailed metrics (CPU, GC, shuffle, I/O, memory)
+    if batch_detail is not None:
+        details = data.get("batch_details", [])
+        details.append(batch_detail)
+        data["batch_details"] = details[-_MAX_TIMINGS:]
+
+    # Cumulative executor metrics
+    if executor_metrics is not None:
+        data["executor"] = executor_metrics
 
     _save(data)
     logger.debug("Spark metrics written: batches=%d rows=%d",

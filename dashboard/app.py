@@ -1046,6 +1046,127 @@ elif page == "📈 Performance":
 
         st.metric("Total Rows Processed", f"{spark['total_rows_processed']:,}")
         st.metric("Last Batch Rows", f"{spark['last_batch_rows']:,}")
+
+        # ── Detailed Execution Metrics (for migration evaluation) ──
+        st.markdown("---")
+        st.markdown("##### 🔬 Execution Metrics (Migration Baseline)")
+
+        batch_details = spark.get("batch_details", [])
+        executor_data = spark.get("executor", {})
+
+        if executor_data:
+            st.markdown("###### Executor Summary (cumulative)")
+            ex1, ex2, ex3, ex4 = st.columns(4)
+            ex1.metric("Total Tasks", f"{executor_data.get('total_tasks', 0):,}")
+            ex2.metric("Active Cores", f"{executor_data.get('active_cores', 0)}")
+            ex3.metric("Peak JVM Heap", f"{executor_data.get('peak_memory_mb', 0):.0f} MB")
+            ex4.metric("Max Memory", f"{executor_data.get('max_memory_mb', 0):.0f} MB")
+
+            ex5, ex6, ex7, ex8 = st.columns(4)
+            total_dur = executor_data.get("total_duration_ms", 0)
+            ex5.metric("Total Task Time", fmt_duration(total_dur / 1000) if total_dur else "—")
+            ex6.metric("Total GC Time", f"{executor_data.get('total_gc_ms', 0):,.0f} ms")
+            ex7.metric("GC Overhead", f"{executor_data.get('gc_pct', 0):.1f}%")
+            total_shuf = executor_data.get("total_shuffle_read_mb", 0) + executor_data.get("total_shuffle_write_mb", 0)
+            ex8.metric("Total Shuffle", f"{total_shuf:.1f} MB")
+
+            io1, io2, io3, io4 = st.columns(4)
+            io1.metric("Total Input", f"{executor_data.get('total_input_mb', 0):.1f} MB")
+            io2.metric("Total Output", f"{executor_data.get('total_output_mb', 0):.1f} MB")
+            io3.metric("Shuffle Read", f"{executor_data.get('total_shuffle_read_mb', 0):.1f} MB")
+            io4.metric("Shuffle Write", f"{executor_data.get('total_shuffle_write_mb', 0):.1f} MB")
+
+        if batch_details:
+            st.markdown("###### Per-Batch Breakdown")
+
+            detail_df = pd.DataFrame(batch_details)
+            # Display key columns
+            display_cols = [
+                "batch_id", "rows", "wall_ms", "cpu_ms", "gc_ms",
+                "cpu_util_pct", "gc_pct", "input_mb", "output_mb",
+                "shuffle_read_mb", "shuffle_write_mb", "peak_memory_mb", "tasks",
+            ]
+            available = [c for c in display_cols if c in detail_df.columns]
+            if available:
+                rename_map = {
+                    "batch_id": "Batch",
+                    "rows": "Rows",
+                    "wall_ms": "Wall (ms)",
+                    "cpu_ms": "CPU (ms)",
+                    "gc_ms": "GC (ms)",
+                    "cpu_util_pct": "CPU %",
+                    "gc_pct": "GC %",
+                    "input_mb": "In (MB)",
+                    "output_mb": "Out (MB)",
+                    "shuffle_read_mb": "Shuf R (MB)",
+                    "shuffle_write_mb": "Shuf W (MB)",
+                    "peak_memory_mb": "Peak Mem (MB)",
+                    "tasks": "Tasks",
+                }
+                show_df = detail_df[available].rename(columns=rename_map)
+                st.dataframe(show_df, use_container_width=True, hide_index=True)
+
+            # Charts for CPU, GC, Memory across batches
+            ch1, ch2, ch3 = st.columns(3)
+            with ch1:
+                st.caption("CPU Time vs GC Time (ms)")
+                if "cpu_ms" in detail_df.columns and "gc_ms" in detail_df.columns:
+                    st.bar_chart(detail_df[["cpu_ms", "gc_ms"]].rename(
+                        columns={"cpu_ms": "CPU", "gc_ms": "GC"}), use_container_width=True)
+            with ch2:
+                st.caption("CPU Utilization (%)")
+                if "cpu_util_pct" in detail_df.columns:
+                    st.line_chart(detail_df["cpu_util_pct"], use_container_width=True)
+            with ch3:
+                st.caption("Peak Memory (MB)")
+                if "peak_memory_mb" in detail_df.columns:
+                    st.area_chart(detail_df["peak_memory_mb"], use_container_width=True)
+
+            # Shuffle charts
+            if "shuffle_read_mb" in detail_df.columns:
+                sc1, sc2 = st.columns(2)
+                with sc1:
+                    st.caption("Shuffle I/O (MB)")
+                    st.bar_chart(detail_df[["shuffle_read_mb", "shuffle_write_mb"]].rename(
+                        columns={"shuffle_read_mb": "Read", "shuffle_write_mb": "Write"}),
+                        use_container_width=True)
+                with sc2:
+                    st.caption("I/O (MB)")
+                    st.bar_chart(detail_df[["input_mb", "output_mb"]].rename(
+                        columns={"input_mb": "Input", "output_mb": "Output"}),
+                        use_container_width=True)
+
+            # Migration evaluation summary
+            if len(batch_details) >= 2:
+                st.markdown("###### 📊 Migration Evaluation Summary")
+                avg_cpu = detail_df["cpu_ms"].mean() if "cpu_ms" in detail_df.columns else 0
+                avg_gc = detail_df["gc_ms"].mean() if "gc_ms" in detail_df.columns else 0
+                avg_util = detail_df["cpu_util_pct"].mean() if "cpu_util_pct" in detail_df.columns else 0
+                avg_shuf_r = detail_df["shuffle_read_mb"].mean() if "shuffle_read_mb" in detail_df.columns else 0
+                avg_shuf_w = detail_df["shuffle_write_mb"].mean() if "shuffle_write_mb" in detail_df.columns else 0
+                avg_peak = detail_df["peak_memory_mb"].mean() if "peak_memory_mb" in detail_df.columns else 0
+                avg_rows = detail_df["rows"].mean() if "rows" in detail_df.columns else 0
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Avg CPU / Batch", f"{avg_cpu:.0f} ms")
+                m2.metric("Avg GC / Batch", f"{avg_gc:.0f} ms ({100*avg_gc/max(1,avg_cpu):.0f}% of CPU)")
+                m3.metric("Avg CPU Utilization", f"{avg_util:.1f}%",
+                          help="Low % means idle time (likely Python UDF serialization overhead)")
+                m4.metric("Avg Peak Memory", f"{avg_peak:.0f} MB")
+
+                s1, s2, s3, s4 = st.columns(4)
+                s1.metric("Avg Shuffle Read", f"{avg_shuf_r:.2f} MB / batch")
+                s2.metric("Avg Shuffle Write", f"{avg_shuf_w:.2f} MB / batch")
+                s3.metric("Throughput", f"{avg_rows / max(1, detail_df['wall_ms'].mean()) * 1000:.0f} rows/sec"
+                          if "wall_ms" in detail_df.columns else "—")
+                s4.metric("Memory Efficiency",
+                          f"{avg_rows / max(1, avg_peak) * 1000:.0f} rows/GB"
+                          if avg_peak > 0 else "—",
+                          help="Higher = more memory-efficient")
+
+        elif not batch_details and not executor_data:
+            st.info("Detailed metrics will appear when the streaming job runs. "
+                    "The Spark REST API is queried after each micro-batch.")
     else:
         st.info("No Spark metrics yet. Run the streaming job to collect data.")
 
