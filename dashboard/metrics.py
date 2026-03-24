@@ -28,6 +28,7 @@ import math
 
 METRICS_DIR = Path(__file__).resolve().parent.parent / "logs"
 DB_PATH = METRICS_DIR / "pipeline_metrics.duckdb"
+SPARK_JSON_PATH = METRICS_DIR / "spark_metrics.json"
 
 _lock = threading.Lock()
 _local = threading.local()
@@ -207,6 +208,11 @@ def reset_metrics():
             UPDATE pipeline_state SET end_to_end_latency_ms=0.0, last_update=NULL
             WHERE id=1
         """)
+        # Also delete the Spark JSON sidecar (written by container)
+        try:
+            SPARK_JSON_PATH.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def _nan_to_none(v):
@@ -221,13 +227,32 @@ def _nan_to_none(v):
     return v
 
 
+def _read_spark_json() -> dict:
+    """Read Spark metrics from the JSON file written by the container."""
+    try:
+        if SPARK_JSON_PATH.exists():
+            return json.loads(SPARK_JSON_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {
+        "status": "idle",
+        "micro_batches_completed": 0,
+        "total_rows_processed": 0,
+        "last_batch_rows": 0,
+        "first_update": None,
+        "last_update": None,
+        "batch_durations_ms": [],
+        "transform_times_ms": [],
+        "delta_write_times_ms": [],
+    }
+
+
 def get_metrics() -> dict:
     """Read the current metrics snapshot (same dict shape as before)."""
     with _lock:
         conn = _get_conn()
 
         g = conn.execute("SELECT * FROM generator_state WHERE id=1").fetchdf().iloc[0]
-        s = conn.execute("SELECT * FROM spark_state WHERE id=1").fetchdf().iloc[0]
         p = conn.execute("SELECT * FROM pipeline_state WHERE id=1").fetchdf().iloc[0]
 
         # Delta tables
@@ -241,6 +266,12 @@ def get_metrics() -> dict:
                 "size_bytes": int(row["size_bytes"]),
                 "last_update": _nan_to_none(row["last_update"]),
             }
+
+        # ── Spark metrics: read from JSON file (written by container) ──
+        spark_data = _read_spark_json()
+        bd = spark_data.get("batch_durations_ms", [])
+        tt = spark_data.get("transform_times_ms", [])
+        dw = spark_data.get("delta_write_times_ms", [])
 
         return {
             "generator": {
@@ -260,18 +291,18 @@ def get_metrics() -> dict:
                 "last_update": _nan_to_none(g["last_update"]),
             },
             "spark": {
-                "status": s["status"],
-                "micro_batches_completed": int(s["micro_batches_completed"]),
-                "total_rows_processed": int(s["total_rows_processed"]),
-                "avg_batch_duration_ms": float(s["avg_batch_duration_ms"]),
-                "avg_transform_time_ms": float(s["avg_transform_time_ms"]),
-                "avg_delta_write_time_ms": float(s["avg_delta_write_time_ms"]),
-                "batch_durations_ms": _timings_list(conn, "spark_timings", "batch_duration"),
-                "transform_times_ms": _timings_list(conn, "spark_timings", "transform_time"),
-                "delta_write_times_ms": _timings_list(conn, "spark_timings", "delta_write_time"),
-                "last_batch_rows": int(s["last_batch_rows"]),
-                "first_update": _nan_to_none(s["first_update"]),
-                "last_update": _nan_to_none(s["last_update"]),
+                "status": spark_data.get("status", "idle"),
+                "micro_batches_completed": spark_data.get("micro_batches_completed", 0),
+                "total_rows_processed": spark_data.get("total_rows_processed", 0),
+                "avg_batch_duration_ms": sum(bd) / len(bd) if bd else 0.0,
+                "avg_transform_time_ms": sum(tt) / len(tt) if tt else 0.0,
+                "avg_delta_write_time_ms": sum(dw) / len(dw) if dw else 0.0,
+                "batch_durations_ms": bd,
+                "transform_times_ms": tt,
+                "delta_write_times_ms": dw,
+                "last_batch_rows": spark_data.get("last_batch_rows", 0),
+                "first_update": spark_data.get("first_update"),
+                "last_update": spark_data.get("last_update"),
             },
             "delta": delta,
             "pipeline": {

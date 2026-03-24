@@ -53,11 +53,12 @@ logger = logging.getLogger("account_upsert")
 
 # ── Metrics integration (graceful if unavailable) ─────────────
 try:
-    sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
-    from dashboard.metrics import update_spark_metrics
+    from metrics_bridge import update_spark_metrics
     _HAS_METRICS = True
-except Exception:
+    logger.info("Dashboard metrics integration enabled (JSON bridge)")
+except Exception as exc:
     _HAS_METRICS = False
+    logger.warning("Dashboard metrics unavailable: %s", exc)
 
 # ── Account update event schema ───────────────────────────────
 
