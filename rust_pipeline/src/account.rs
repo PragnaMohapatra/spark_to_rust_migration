@@ -33,7 +33,7 @@ pub async fn run_account_upsert_pipeline(cfg: &AppConfig) -> Result<()> {
         .set("enable.auto.commit", "false")
         .set("auto.offset.reset", "earliest")
         .set("fetch.min.bytes", "1")
-        .set("fetch.max.wait.ms", "500")
+        .set("fetch.wait.max.ms", "500")
         .create()?;
 
     let checkpoint = Checkpoint::open(&ckpt_path)?;

@@ -49,6 +49,13 @@ fn parse_timestamp(ts: &str) -> NaiveDateTime {
     if let Ok(dt) = NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S") {
         return dt;
     }
+    // Handle timezone offset formats like +00:00, -05:00 etc.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+        return dt.naive_utc();
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f%:z") {
+        return dt;
+    }
     // Fallback: epoch
     NaiveDateTime::from_timestamp_opt(0, 0).unwrap()
 }

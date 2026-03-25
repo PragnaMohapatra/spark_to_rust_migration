@@ -122,7 +122,7 @@ impl Default for RustConfig {
 impl AppConfig {
     /// Returns true when running inside Docker (/opt paths exist).
     pub fn is_docker(&self) -> bool {
-        Path::new("/opt/spark-jobs").exists()
+        Path::new("/opt/config").exists() || Path::new("/opt/spark-jobs").exists()
     }
 
     pub fn kafka_bootstrap(&self) -> &str {

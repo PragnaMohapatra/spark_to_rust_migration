@@ -44,7 +44,7 @@ pub async fn run_streaming_pipeline(cfg: &AppConfig) -> Result<()> {
         .set("enable.auto.commit", "false")
         .set("auto.offset.reset", "earliest")
         .set("fetch.min.bytes", "1")
-        .set("fetch.max.wait.ms", "500")
+        .set("fetch.wait.max.ms", "500")
         .set("max.partition.fetch.bytes", "10485760")
         .create()?;
 

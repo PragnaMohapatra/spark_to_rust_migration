@@ -1,9 +1,9 @@
 # ── Builder stage ──────────────────────────────────────────────
-FROM rust:1.82-slim-bookworm AS builder
+FROM rust:1.85-slim-bookworm AS builder
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y \
-    cmake g++ libssl-dev pkg-config libsasl2-dev \
+    cmake g++ libssl-dev pkg-config libsasl2-dev libcurl4-openssl-dev libzstd-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock* ./
@@ -22,4 +22,3 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/rust-pipeline /usr/local/bin/rust-pipeline
-ENTRYPOINT ["sleep", "infinity"]
