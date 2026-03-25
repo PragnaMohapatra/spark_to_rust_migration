@@ -567,23 +567,145 @@ elif page == "⚙️ Spark Jobs":
                 else:
                     st.info("No log file yet.")
 
+    # ── Rust Pipeline ─────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🦀 Rust Pipeline")
+    st.markdown(
+        "Launch Rust pipeline jobs inside the `rust-pipeline` container for "
+        "migration validation. Rust writes to separate `_rust` Delta tables."
+    )
+
+    RUST_JOBS = {
+        "rust_stream": {
+            "title": "📡 Rust Streaming (Kafka → Delta)",
+            "desc": "Reads financial transactions from Kafka, applies the same 7 transforms "
+                    "in Rust (rayon parallel), and writes to the `financial_transactions_rust` "
+                    "Delta table via delta-rs.",
+            "subcommand": "stream",
+            "long_running": True,
+        },
+        "rust_upsert": {
+            "title": "👤 Rust Account Upsert (Kafka → Delta MERGE)",
+            "desc": "Reads account-update events from Kafka and upserts into `accounts_rust` "
+                    "Delta table using delta-rs MERGE. Separate consumer group from Spark.",
+            "subcommand": "upsert",
+            "long_running": True,
+        },
+        "rust_validate": {
+            "title": "✅ Validation (Spark vs Rust)",
+            "desc": "Compares Spark and Rust Delta tables using DataFusion SQL — reports "
+                    "row parity, numeric tolerance checks, and string equality. Results "
+                    "appear on the Performance page.",
+            "subcommand": "validate",
+            "long_running": False,
+        },
+    }
+
+    def _start_rust_job(name: str, subcommand: str):
+        """Start a Rust pipeline job inside the rust-pipeline container."""
+        cmd = [
+            "docker", "exec", "rust-pipeline",
+            "/usr/local/bin/rust-pipeline",
+            "--config", "/opt/config/app_config.yaml",
+            subcommand,
+        ]
+        log_path = PROJECT_ROOT / "logs" / f"{name}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_file = open(log_path, "w")
+        proc = subprocess.Popen(
+            cmd, cwd=str(PROJECT_ROOT),
+            stdout=log_file, stderr=subprocess.STDOUT,
+        )
+        st.session_state.spark_processes[name] = proc
+        return proc
+
+    def _stop_rust_job(name: str):
+        """Stop a running Rust pipeline job."""
+        try:
+            subprocess.run(
+                ["docker", "exec", "rust-pipeline", "bash", "-c",
+                 "pkill -f 'rust-pipeline' || true"],
+                timeout=10, capture_output=True,
+            )
+        except Exception:
+            pass
+        proc = st.session_state.spark_processes.get(name)
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        st.session_state.spark_processes.pop(name, None)
+
+    for job_key, job_info in RUST_JOBS.items():
+        with st.container(border=True):
+            st.subheader(job_info["title"])
+            st.caption(job_info["desc"])
+
+            status = _check_proc(job_key)
+            status_icon = {"running": "🟢", "completed": "✅", "stopped": "⚪"}
+            icon = status_icon.get(status, "🔴")
+
+            col1, col2, col3 = st.columns([2, 1, 1])
+            with col1:
+                st.write(f"**Status:** {icon} {status}")
+            with col2:
+                if status == "running":
+                    if st.button("⏹️ Stop", key=f"stop_{job_key}"):
+                        _stop_rust_job(job_key)
+                        st.success(f"{job_info['title']} stopped.")
+                        time.sleep(0.5)
+                        st.rerun()
+                else:
+                    if st.button("▶️ Start", key=f"start_{job_key}", type="primary"):
+                        _start_rust_job(job_key, job_info["subcommand"])
+                        st.success(f"{job_info['title']} started!")
+                        time.sleep(0.5)
+                        st.rerun()
+            with col3:
+                log_path = PROJECT_ROOT / "logs" / f"{job_key}.log"
+                if log_path.exists():
+                    if st.button("📄 Logs", key=f"logs_{job_key}"):
+                        st.session_state[f"show_logs_{job_key}"] = not st.session_state.get(f"show_logs_{job_key}", False)
+
+            if st.session_state.get(f"show_logs_{job_key}", False):
+                log_path = PROJECT_ROOT / "logs" / f"{job_key}.log"
+                if log_path.exists():
+                    log_content = log_path.read_text(errors="replace")
+                    lines = log_content.strip().split("\n")
+                    tail = "\n".join(lines[-100:])
+                    st.code(tail, language="log")
+                else:
+                    st.info("No log file yet.")
+
     st.markdown("---")
 
     # ── Bulk Controls ─────────────────────────────────────
     st.subheader("Bulk Controls")
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
-        if st.button("▶️ Start All Streaming Jobs", type="primary"):
+        if st.button("▶️ Start Spark Streaming", type="primary"):
             for key in ["streaming", "account_upsert"]:
                 if _check_proc(key) != "running":
                     _start_spark_job(key, SPARK_JOBS[key]["script"])
-            st.success("Streaming + Account Upsert jobs started!")
+            st.success("Spark streaming jobs started!")
             time.sleep(0.5)
             st.rerun()
     with col2:
+        if st.button("🦀 Start Rust Streaming", type="primary"):
+            for key in ["rust_stream", "rust_upsert"]:
+                if _check_proc(key) != "running":
+                    _start_rust_job(key, RUST_JOBS[key]["subcommand"])
+            st.success("Rust streaming jobs started!")
+            time.sleep(0.5)
+            st.rerun()
+    with col3:
         if st.button("⏹️ Stop All Jobs"):
             for key in SPARK_JOBS:
                 _stop_spark_job(key)
+            for key in RUST_JOBS:
+                _stop_rust_job(key)
             st.success("All jobs stopped.")
             time.sleep(0.5)
             st.rerun()
@@ -606,15 +728,21 @@ elif page == "⚙️ Spark Jobs":
     _ckpt_paths = [
         ("Transactions checkpoint", Path(cfg["spark"].get("local_checkpoint", "./checkpoints/financial_txn"))),
         ("Accounts checkpoint", Path(cfg["accounts"].get("local_checkpoint", "./checkpoints/account_upsert"))),
+        ("Rust Txn checkpoint", Path(cfg.get("rust", {}).get("local_checkpoint_db", "./checkpoints/rust_financial_txn/offsets.db")).parent),
+        ("Rust Acct checkpoint", Path(cfg.get("rust", {}).get("local_accounts_checkpoint_db", "./checkpoints/rust_account_upsert/offsets.db")).parent),
     ]
     _delta_paths = [
         ("Transactions Delta", Path(cfg["delta"].get("table_path", "./delta_output/financial_transactions"))),
         ("Accounts Delta", Path(cfg["delta"].get("accounts_table_path", "./delta_output/accounts"))),
+        ("Rust Transactions Delta", Path(cfg.get("rust", {}).get("local_delta_output", "./delta_output/financial_transactions_rust"))),
+        ("Rust Accounts Delta", Path(cfg.get("rust", {}).get("local_accounts_delta_output", "./delta_output/accounts_rust"))),
     ]
 
     def _stop_all_jobs():
         for key in SPARK_JOBS:
             _stop_spark_job(key)
+        for key in RUST_JOBS:
+            _stop_rust_job(key)
 
     def _wipe_paths(paths: list[tuple[str, Path]]) -> list[str]:
         import shutil
@@ -728,14 +856,16 @@ elif page == "🔍 Delta Explorer":
 
     table_choice = st.selectbox(
         "Select Table",
-        ["Transactions", "Accounts"],
+        ["Transactions", "Accounts", "Transactions (Rust)", "Accounts (Rust)"],
     )
 
-    table_path = (
-        cfg["delta"]["table_path"]
-        if table_choice == "Transactions"
-        else cfg["delta"]["accounts_table_path"]
-    )
+    _table_path_map = {
+        "Transactions": cfg["delta"]["table_path"],
+        "Accounts": cfg["delta"]["accounts_table_path"],
+        "Transactions (Rust)": cfg.get("rust", {}).get("local_delta_output", "./delta_output/financial_transactions_rust"),
+        "Accounts (Rust)": cfg.get("rust", {}).get("local_accounts_delta_output", "./delta_output/accounts_rust"),
+    }
+    table_path = _table_path_map[table_choice]
 
     info = get_delta_table_info(table_path)
 
@@ -1169,6 +1299,94 @@ elif page == "📈 Performance":
                     "The Spark REST API is queried after each micro-batch.")
     else:
         st.info("No Spark metrics yet. Run the streaming job to collect data.")
+
+    # ── Spark vs Rust Comparison ──────────────────────────
+    st.markdown("---")
+    st.subheader("🦀 Spark vs Rust Comparison")
+
+    rust = metrics.get("rust", {})
+    validation = metrics.get("validation", {})
+
+    if rust.get("micro_batches_completed", 0) > 0:
+        st.markdown("##### ⚡ Head-to-Head Metrics")
+        cmp1, cmp2 = st.columns(2)
+        with cmp1:
+            st.markdown("**Spark**")
+            st.metric("Batches", f"{spark['micro_batches_completed']:,}")
+            st.metric("Rows Processed", f"{spark['total_rows_processed']:,}")
+            st.metric("Avg Batch Duration", f"{spark['avg_batch_duration_ms']:.0f} ms")
+            st.metric("Avg Transform Time", f"{spark['avg_transform_time_ms']:.0f} ms")
+            st.metric("Avg Delta Write Time", f"{spark['avg_delta_write_time_ms']:.0f} ms")
+            spark_gc_ms = sum(d.get("gc_ms", 0) for d in spark.get("batch_details", []))
+            st.metric("Total GC Time", f"{spark_gc_ms:,.0f} ms")
+        with cmp2:
+            st.markdown("**Rust**")
+            st.metric("Batches", f"{rust.get('micro_batches_completed', 0):,}")
+            st.metric("Rows Processed", f"{rust.get('total_rows_processed', 0):,}")
+            st.metric("Avg Batch Duration", f"{rust.get('avg_batch_duration_ms', 0):.0f} ms")
+            st.metric("Avg Transform Time", f"{rust.get('avg_transform_time_ms', 0):.0f} ms")
+            st.metric("Avg Delta Write Time", f"{rust.get('avg_delta_write_time_ms', 0):.0f} ms")
+            st.metric("Total GC Time", "0 ms *(no GC)*")
+
+        # Speedup metric
+        if spark['avg_batch_duration_ms'] > 0 and rust.get('avg_batch_duration_ms', 0) > 0:
+            speedup = spark['avg_batch_duration_ms'] / rust['avg_batch_duration_ms']
+            delta_label = (f"{(speedup - 1) * 100:.0f}% faster"
+                           if speedup > 1
+                           else f"{(1 - speedup) * 100:.0f}% slower")
+            st.metric("🏎️ Rust Speedup", f"{speedup:.2f}x", delta=delta_label)
+
+        # Batch duration overlay chart
+        rust_bd = rust.get("batch_durations_ms", [])
+        spark_bd = spark.get("batch_durations_ms", [])
+        if rust_bd:
+            st.markdown("##### Batch Duration Comparison (ms)")
+            max_len = max(len(spark_bd), len(rust_bd))
+            compare_df = pd.DataFrame({
+                "Spark": spark_bd + [None] * (max_len - len(spark_bd)),
+                "Rust": rust_bd + [None] * (max_len - len(rust_bd)),
+            })
+            st.line_chart(compare_df, use_container_width=True)
+
+        # Rust detailed batch table
+        rust_details = rust.get("batch_details", [])
+        if rust_details:
+            st.markdown("##### 🦀 Rust Per-Batch Breakdown")
+            rdf = pd.DataFrame(rust_details)
+            r_display = [c for c in ["batch_id", "rows", "wall_ms", "cpu_ms", "gc_ms",
+                                      "peak_memory_mb"] if c in rdf.columns]
+            if r_display:
+                st.dataframe(rdf[r_display], use_container_width=True, hide_index=True)
+    else:
+        st.info("Run the Rust pipeline to see comparison metrics. "
+                "Start **Rust Streaming** on the Spark Jobs page.")
+
+    # Validation report
+    if validation:
+        st.markdown("##### ✅ Validation Report")
+        v1, v2, v3, v4 = st.columns(4)
+        spark_rc = validation.get("spark_row_count", "—")
+        rust_rc = validation.get("rust_row_count", "—")
+        v1.metric("Spark Rows", f"{spark_rc:,}" if isinstance(spark_rc, int) else str(spark_rc))
+        v2.metric("Rust Rows", f"{rust_rc:,}" if isinstance(rust_rc, int) else str(rust_rc))
+        v3.metric("Parity", f"{validation.get('parity_pct', 0):.4f}%")
+        v4.metric("Status", validation.get("status", "—"))
+
+        if validation.get("missing_in_rust", 0) > 0 or validation.get("missing_in_spark", 0) > 0:
+            m1, m2 = st.columns(2)
+            m1.metric("Missing in Rust", validation.get("missing_in_rust", 0))
+            m2.metric("Missing in Spark", validation.get("missing_in_spark", 0))
+
+        if validation.get("mismatch_columns"):
+            st.markdown("###### Mismatched Columns")
+            mc_df = pd.DataFrame([
+                {"Column": k, "Mismatches": v}
+                for k, v in validation["mismatch_columns"].items()
+            ])
+            st.dataframe(mc_df, use_container_width=True, hide_index=True)
+
+        with st.expander("📋 Raw Validation JSON"):
+            st.json(validation)
 
     st.markdown("---")
 

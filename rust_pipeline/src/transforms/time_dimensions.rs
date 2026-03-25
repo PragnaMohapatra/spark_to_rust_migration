@@ -1,0 +1,67 @@
+use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike, Weekday};
+
+pub struct TimeDimensions {
+    pub transaction_date: i32, // days since 1970-01-01 for Arrow Date32
+    pub txn_year: i32,
+    pub txn_month: i32,
+    pub txn_day: i32,
+    pub txn_hour: i32,
+    pub txn_dayofweek: i32, // Spark convention: 1=Sun, 7=Sat
+    pub is_weekend: bool,
+    pub txn_quarter: i32,
+    pub date_str: String, // "yyyy-MM-dd"
+}
+
+static EPOCH: once_cell::sync::Lazy<NaiveDate> =
+    once_cell::sync::Lazy::new(|| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+
+/// Spark parity: add_time_dimensions
+/// Parses ISO-8601 timestamp and extracts temporal features.
+pub fn apply(timestamp: &str) -> TimeDimensions {
+    let dt = parse_timestamp(timestamp);
+    let date = dt.date();
+    let dow = spark_dayofweek(date.weekday());
+
+    TimeDimensions {
+        transaction_date: (date - *EPOCH).num_days() as i32,
+        txn_year: date.year(),
+        txn_month: date.month() as i32,
+        txn_day: date.day() as i32,
+        txn_hour: dt.hour() as i32,
+        txn_dayofweek: dow,
+        is_weekend: dow == 1 || dow == 7,
+        txn_quarter: ((date.month() - 1) / 3 + 1) as i32,
+        date_str: date.format("%Y-%m-%d").to_string(),
+    }
+}
+
+fn parse_timestamp(ts: &str) -> NaiveDateTime {
+    // Try multiple ISO-8601 formats
+    if let Ok(dt) = NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.fZ") {
+        return dt;
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%SZ") {
+        return dt;
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f") {
+        return dt;
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S") {
+        return dt;
+    }
+    // Fallback: epoch
+    NaiveDateTime::from_timestamp_opt(0, 0).unwrap()
+}
+
+/// Convert chrono weekday to Spark's convention: 1=Sun, 2=Mon, ..., 7=Sat
+fn spark_dayofweek(wd: Weekday) -> i32 {
+    match wd {
+        Weekday::Sun => 1,
+        Weekday::Mon => 2,
+        Weekday::Tue => 3,
+        Weekday::Wed => 4,
+        Weekday::Thu => 5,
+        Weekday::Fri => 6,
+        Weekday::Sat => 7,
+    }
+}

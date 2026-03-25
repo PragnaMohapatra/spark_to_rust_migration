@@ -60,6 +60,22 @@ delta:
   # Compact threshold — number of files before triggering compaction
   compact_threshold: 50
 
+rust:
+  consumer_group: "rust-financial-txn-consumer"
+  batch_size: 500000
+  flush_interval_seconds: 10
+  delta_output_path: "/opt/delta_output/financial_transactions_rust"
+  local_delta_output: "./delta_output/financial_transactions_rust"
+  checkpoint_db: "/opt/checkpoints/rust_financial_txn/offsets.db"
+  local_checkpoint_db: "./checkpoints/rust_financial_txn/offsets.db"
+  accounts_delta_output_path: "/opt/delta_output/accounts_rust"
+  local_accounts_delta_output: "./delta_output/accounts_rust"
+  accounts_checkpoint_db: "/opt/checkpoints/rust_account_upsert/offsets.db"
+  local_accounts_checkpoint_db: "./checkpoints/rust_account_upsert/offsets.db"
+  accounts_consumer_group: "rust-account-upsert-consumer"
+  metrics_file: "/opt/logs/rust_metrics.json"
+  accounts_metrics_file: "/opt/logs/rust_acct_metrics.json"
+
 logging:
   level: "INFO"
   format: "%(asctime)s [%(levelname)s] %(name)s — %(message)s"

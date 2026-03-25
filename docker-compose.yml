@@ -124,6 +124,23 @@ services:
       - ./logs:/opt/logs
       - ./jars:/opt/extra-jars
 
+  rust-pipeline:
+    build:
+      context: ./rust_pipeline
+      dockerfile: Dockerfile
+    container_name: rust-pipeline
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./config:/opt/config:ro
+      - ./delta_output:/opt/delta_output
+      - ./checkpoints:/opt/checkpoints
+      - ./logs:/opt/logs
+    environment:
+      - RUST_LOG=info
+    command: ["sleep", "infinity"]
+
 volumes:
   delta_output:
   checkpoints:
