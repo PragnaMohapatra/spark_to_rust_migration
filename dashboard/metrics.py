@@ -1,243 +1,128 @@
 """
 Shared metrics store for pipeline instrumentation.
 
-Provides a thread-safe, DuckDB-backed metrics collector.  The data
-generator writes metrics here; the Streamlit dashboard reads them for
-real-time progress and performance monitoring.
+Provides a thread-safe, JSON-file-backed metrics reader.  Each pipeline
+container writes its own JSON sidecar to the shared ``logs/`` volume.
+The Streamlit dashboard reads those files to build the metrics dict.
 
-Tables:
-  - generator_state:   scalar counters (status, bytes_sent, throughput, …)
-  - generator_timings: rolling time-series (batch_time_ms, publish_latency_ms)
-  - spark_state:       scalar Spark counters
-  - spark_timings:     rolling Spark time-series
-  - delta_tables:      per-table statistics (version, row_count, size_bytes)
-  - pipeline_state:    end-to-end latency
+Delta table statistics are computed on-demand via the ``deltalake``
+Python library (no database required).
 
-The public API is unchanged from the previous JSON-backed version so
+The public API is unchanged from the previous DuckDB-backed version so
 callers (dashboard/app.py, data_generator/generator.py) require no changes.
 """
 
 import json
+import logging
+import os
 import threading
 import time
 from pathlib import Path
 from typing import Optional
 
-import duckdb
-import math
+logger = logging.getLogger(__name__)
 
 METRICS_DIR = Path(__file__).resolve().parent.parent / "logs"
-DB_PATH = METRICS_DIR / "pipeline_metrics.duckdb"
+DELTA_OUTPUT_DIR = Path(__file__).resolve().parent.parent / "delta_output"
 SPARK_JSON_PATH = METRICS_DIR / "spark_metrics.json"
+SPARK_API_DUMP_PATH = METRICS_DIR / "spark_api_dump.json"
 RUST_JSON_PATH = METRICS_DIR / "rust_metrics.json"
 RUST_ACCT_JSON_PATH = METRICS_DIR / "rust_acct_metrics.json"
 VALIDATION_JSON_PATH = METRICS_DIR / "validation_report.json"
+GENERATOR_JSON_PATH = METRICS_DIR / "generator_metrics.json"
 
 _lock = threading.Lock()
-_local = threading.local()
-
-# Maximum rolling time-series rows kept per category
-_MAX_TIMINGS = 200
 
 
-# ── Connection management ─────────────────────────────────────
+# ── Delta table helpers ───────────────────────────────────────
+
+# Known Delta tables and their paths (relative to DELTA_OUTPUT_DIR)
+_DELTA_TABLES = {
+    "transactions": "financial_transactions",
+    "accounts": "accounts",
+}
 
 
-def _get_conn() -> duckdb.DuckDBPyConnection:
-    """Return a per-thread DuckDB connection (thread-safe)."""
-    conn = getattr(_local, "conn", None)
-    if conn is None:
-        METRICS_DIR.mkdir(parents=True, exist_ok=True)
-        conn = duckdb.connect(str(DB_PATH))
-        _local.conn = conn
-        _init_tables(conn)
-    return conn
+def _read_delta_table_stats(table_name: str) -> dict:
+    """Read Delta table stats on-demand using the deltalake library.
 
-
-def _init_tables(conn: duckdb.DuckDBPyConnection):
-    """Create tables if they don't exist."""
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS generator_state (
-            id              INTEGER DEFAULT 1 PRIMARY KEY,
-            status          VARCHAR DEFAULT 'idle',
-            start_time      DOUBLE,
-            target_bytes    BIGINT  DEFAULT 0,
-            bytes_sent      BIGINT  DEFAULT 0,
-            records_sent    BIGINT  DEFAULT 0,
-            batches_completed INTEGER DEFAULT 0,
-            elapsed_seconds DOUBLE  DEFAULT 0.0,
-            throughput_mb_per_sec DOUBLE DEFAULT 0.0,
-            avg_batch_time_ms     DOUBLE DEFAULT 0.0,
-            avg_publish_latency_ms DOUBLE DEFAULT 0.0,
-            errors          INTEGER DEFAULT 0,
-            last_update     DOUBLE
-        )
-    """)
-    conn.execute("""
-        INSERT OR IGNORE INTO generator_state (id) VALUES (1)
-    """)
-
-    conn.execute("CREATE SEQUENCE IF NOT EXISTS gen_timing_seq START 1")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS generator_timings (
-            id        INTEGER PRIMARY KEY DEFAULT(nextval('gen_timing_seq')),
-            category  VARCHAR NOT NULL,
-            value_ms  DOUBLE  NOT NULL,
-            ts        DOUBLE  NOT NULL
-        )
-    """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS spark_state (
-            id              INTEGER DEFAULT 1 PRIMARY KEY,
-            status          VARCHAR DEFAULT 'idle',
-            micro_batches_completed INTEGER DEFAULT 0,
-            total_rows_processed    BIGINT  DEFAULT 0,
-            avg_batch_duration_ms   DOUBLE  DEFAULT 0.0,
-            avg_transform_time_ms   DOUBLE  DEFAULT 0.0,
-            avg_delta_write_time_ms DOUBLE  DEFAULT 0.0,
-            last_batch_rows INTEGER DEFAULT 0,
-            first_update    DOUBLE,
-            last_update     DOUBLE
-        )
-    """)
-    conn.execute("INSERT OR IGNORE INTO spark_state (id) VALUES (1)")
-
-    conn.execute("CREATE SEQUENCE IF NOT EXISTS spark_timing_seq START 1")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS spark_timings (
-            id        INTEGER PRIMARY KEY DEFAULT(nextval('spark_timing_seq')),
-            category  VARCHAR NOT NULL,
-            value_ms  DOUBLE  NOT NULL,
-            ts        DOUBLE  NOT NULL
-        )
-    """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS delta_tables (
-            table_name VARCHAR PRIMARY KEY,
-            version    INTEGER DEFAULT 0,
-            num_files  INTEGER DEFAULT 0,
-            row_count  BIGINT  DEFAULT 0,
-            size_bytes BIGINT  DEFAULT 0,
-            last_update DOUBLE
-        )
-    """)
-    # Seed the two known tables
-    conn.execute("""
-        INSERT OR IGNORE INTO delta_tables (table_name) VALUES ('transactions')
-    """)
-    conn.execute("""
-        INSERT OR IGNORE INTO delta_tables (table_name) VALUES ('accounts')
-    """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS pipeline_state (
-            id                    INTEGER DEFAULT 1 PRIMARY KEY,
-            end_to_end_latency_ms DOUBLE DEFAULT 0.0,
-            last_update           DOUBLE
-        )
-    """)
-    conn.execute("INSERT OR IGNORE INTO pipeline_state (id) VALUES (1)")
-
-
-def _trim_timings(conn: duckdb.DuckDBPyConnection, table: str, category: str):
-    """Keep only the most recent _MAX_TIMINGS rows per category."""
-    conn.execute(f"""
-        DELETE FROM {table}
-        WHERE category = ? AND id NOT IN (
-            SELECT id FROM {table}
-            WHERE category = ?
-            ORDER BY id DESC
-            LIMIT ?
-        )
-    """, [category, category, _MAX_TIMINGS])
-
-
-def _timings_list(conn: duckdb.DuckDBPyConnection, table: str, category: str) -> list:
-    """Return rolling timing values as a plain list."""
-    rows = conn.execute(f"""
-        SELECT value_ms FROM {table}
-        WHERE category = ?
-        ORDER BY id DESC
-        LIMIT ?
-    """, [category, _MAX_TIMINGS]).fetchall()
-    return [r[0] for r in reversed(rows)]
-
-
-def _timings_avg(conn: duckdb.DuckDBPyConnection, table: str, category: str) -> float:
-    """Return the average of the rolling window for a category."""
-    row = conn.execute(f"""
-        SELECT AVG(value_ms) FROM (
-            SELECT value_ms FROM {table}
-            WHERE category = ?
-            ORDER BY id DESC
-            LIMIT ?
-        )
-    """, [category, _MAX_TIMINGS]).fetchone()
-    return round(row[0], 2) if row[0] is not None else 0.0
+    Uses only metadata operations — never reads the full table into memory.
+    Falls back to file-count-only stats if metadata read fails.
+    """
+    _DEFAULT = {"version": 0, "num_files": 0, "row_count": 0,
+                "size_bytes": 0, "last_update": None}
+    table_dir = DELTA_OUTPUT_DIR / _DELTA_TABLES.get(table_name, table_name)
+    try:
+        if not table_dir.exists():
+            return _DEFAULT
+        # Check for _delta_log directory — required for a valid delta table
+        delta_log = table_dir / "_delta_log"
+        if not delta_log.exists():
+            return _DEFAULT
+        from deltalake import DeltaTable
+        import pyarrow as pa
+        dt = DeltaTable(str(table_dir))
+        version = dt.version()
+        # Get row count and file sizes from metadata (avoids slow per-file stat calls)
+        arro3_table = dt.get_add_actions(flatten=True)
+        add_actions = pa.table(arro3_table).to_pydict()
+        row_count = sum(add_actions.get("num_records", [0]))
+        total_size = sum(add_actions.get("size_bytes", [0]))
+        num_files = len(add_actions.get("path", []))
+        return {
+            "version": version,
+            "num_files": num_files,
+            "row_count": int(row_count),
+            "size_bytes": total_size,
+            "last_update": time.time(),
+        }
+    except Exception as exc:
+        logger.debug("Could not read delta table %s: %s", table_name, exc)
+        return {"version": 0, "num_files": 0, "row_count": 0,
+                "size_bytes": 0, "last_update": None}
 
 
 # ── Public API (unchanged signatures) ────────────────────────
 
 
 def reset_metrics():
-    """Reset all metrics to defaults."""
+    """Reset all metrics by deleting JSON sidecar files."""
     with _lock:
-        conn = _get_conn()
-        conn.execute("DELETE FROM generator_timings")
-        conn.execute("DELETE FROM spark_timings")
-        conn.execute("""
-            UPDATE generator_state SET
-                status='idle', start_time=NULL, target_bytes=0, bytes_sent=0,
-                records_sent=0, batches_completed=0, elapsed_seconds=0.0,
-                throughput_mb_per_sec=0.0, avg_batch_time_ms=0.0,
-                avg_publish_latency_ms=0.0, errors=0, last_update=NULL
-            WHERE id=1
-        """)
-        conn.execute("""
-            UPDATE spark_state SET
-                status='idle', micro_batches_completed=0, total_rows_processed=0,
-                avg_batch_duration_ms=0.0, avg_transform_time_ms=0.0,
-                avg_delta_write_time_ms=0.0, last_batch_rows=0,
-                first_update=NULL, last_update=NULL
-            WHERE id=1
-        """)
-        conn.execute("""
-            UPDATE delta_tables SET version=0, num_files=0, row_count=0,
-                size_bytes=0, last_update=NULL
-        """)
-        conn.execute("""
-            UPDATE pipeline_state SET end_to_end_latency_ms=0.0, last_update=NULL
-            WHERE id=1
-        """)
-        # Also delete the Spark/Rust JSON sidecars (written by containers)
-        for p in [SPARK_JSON_PATH, RUST_JSON_PATH, RUST_ACCT_JSON_PATH, VALIDATION_JSON_PATH]:
+        for p in [SPARK_JSON_PATH, RUST_JSON_PATH, RUST_ACCT_JSON_PATH,
+                   VALIDATION_JSON_PATH, GENERATOR_JSON_PATH]:
             try:
                 p.unlink(missing_ok=True)
             except Exception:
                 pass
 
 
-def _nan_to_none(v):
-    """Convert numpy NaN (returned by DuckDB for NULL) to Python None."""
-    if v is None:
-        return None
-    try:
-        if math.isnan(v):
-            return None
-    except (TypeError, ValueError):
-        pass
-    return v
-
-
 def _read_spark_json() -> dict:
-    """Read Spark metrics from the JSON file written by the container."""
+    """Read Spark metrics from the best available source.
+
+    Checks both spark_metrics.json (live container) and spark_api_dump.json
+    (Spark REST API dump).  Returns whichever has more micro-batches so that
+    a complete historical run is preferred over an incomplete live snapshot.
+    """
+    live = None
     try:
         if SPARK_JSON_PATH.exists():
-            return json.loads(SPARK_JSON_PATH.read_text(encoding="utf-8"))
+            live = json.loads(SPARK_JSON_PATH.read_text(encoding="utf-8"))
     except Exception:
         pass
+
+    dump = _parse_spark_api_dump()
+
+    # Pick the richer source
+    live_batches = (live or {}).get("micro_batches_completed", 0)
+    dump_batches = (dump or {}).get("micro_batches_completed", 0)
+
+    if live and dump:
+        return live if live_batches >= dump_batches else dump
+    if live:
+        return live
+    if dump:
+        return dump
+
     return {
         "status": "idle",
         "micro_batches_completed": 0,
@@ -248,6 +133,132 @@ def _read_spark_json() -> dict:
         "batch_durations_ms": [],
         "transform_times_ms": [],
         "delta_write_times_ms": [],
+    }
+
+
+def _parse_spark_api_dump() -> dict | None:
+    """Parse spark_api_dump.json (Spark REST API response) into the
+    normalised metrics dict that the dashboard expects.
+
+    The dump contains ``stages.value`` (list of completed stage objects)
+    and ``executors.value``.  Stages whose description contains
+    ``"batch = <N>"`` are grouped into micro-batches and aggregated.
+    """
+    import re as _re
+
+    try:
+        if not SPARK_API_DUMP_PATH.exists():
+            return None
+        raw = SPARK_API_DUMP_PATH.read_bytes()
+        data = json.loads(raw.decode("utf-8-sig"))
+    except Exception:
+        return None
+
+    stages = data.get("stages", {}).get("value", [])
+    if not stages:
+        return None
+
+    # Group stages by batch number ------------------------------------------
+    batch_map: dict[int, list] = {}
+    for stg in stages:
+        desc = stg.get("description", "") or stg.get("name", "")
+        m = _re.search(r"batch\s*=\s*(\d+)", desc, _re.IGNORECASE)
+        if m:
+            batch_id = int(m.group(1))
+            batch_map.setdefault(batch_id, []).append(stg)
+
+    if not batch_map:
+        return None
+
+    # Aggregate per-batch metrics -------------------------------------------
+    batch_details = []
+    batch_durations_ms: list[float] = []
+    transform_times_ms: list[float] = []
+    delta_write_times_ms: list[float] = []
+    total_rows = 0
+
+    for bid in sorted(batch_map):
+        stg_list = batch_map[bid]
+        rows = sum(s.get("inputRecords", 0) for s in stg_list)
+        run_ms = sum(s.get("executorRunTime", 0) for s in stg_list)
+        # executorCpuTime is in nanoseconds in Spark REST API
+        cpu_ns = sum(s.get("executorCpuTime", 0) for s in stg_list)
+        cpu_ms = cpu_ns / 1_000_000
+        gc_ms = sum(s.get("jvmGcTime", 0) for s in stg_list)
+        in_bytes = sum(s.get("inputBytes", 0) for s in stg_list)
+        out_bytes = sum(s.get("outputBytes", 0) for s in stg_list)
+        shuf_r = sum(s.get("shuffleReadBytes", 0) for s in stg_list)
+        shuf_w = sum(s.get("shuffleWriteBytes", 0) for s in stg_list)
+        tasks = sum(s.get("numCompleteTasks", 0) for s in stg_list)
+        peak_mem = max((s.get("peakExecutionMemory", 0) for s in stg_list), default=0)
+
+        # Estimate "transform" as cpu_ms; "write" as run_ms - cpu_ms (I/O wait)
+        write_ms = max(0, run_ms - cpu_ms)
+
+        total_rows += rows
+        batch_durations_ms.append(float(run_ms))
+        transform_times_ms.append(round(cpu_ms, 1))
+        delta_write_times_ms.append(round(write_ms, 1))
+
+        batch_details.append({
+            "batch_id": bid,
+            "rows": rows,
+            "wall_ms": run_ms,
+            "cpu_ms": round(cpu_ms, 1),
+            "gc_ms": gc_ms,
+            "cpu_util_pct": round(cpu_ms / max(1, run_ms) * 100, 1),
+            "gc_pct": round(gc_ms / max(1, run_ms) * 100, 1),
+            "input_mb": round(in_bytes / 1_048_576, 2),
+            "output_mb": round(out_bytes / 1_048_576, 2),
+            "shuffle_read_mb": round(shuf_r / 1_048_576, 2),
+            "shuffle_write_mb": round(shuf_w / 1_048_576, 2),
+            "peak_memory_mb": round(peak_mem / 1_048_576, 2),
+            "tasks": tasks,
+        })
+
+    # Executor summary -------------------------------------------------------
+    executors = data.get("executors", {}).get("value", [])
+    exec_summary = {}
+    if executors:
+        active_cores = sum(e.get("totalCores", 0) for e in executors if e.get("id") != "driver")
+        total_tasks = sum(e.get("totalTasks", 0) for e in executors)
+        total_gc_ms = sum(e.get("totalGCTime", 0) for e in executors)
+        total_dur_ms = sum(e.get("totalDuration", 0) for e in executors)
+        total_input = sum(e.get("totalInputBytes", 0) for e in executors)
+        total_output = sum(e.get("totalOutputBytes", 0) for e in executors)
+        total_shuf_r = sum(e.get("totalShuffleRead", 0) for e in executors)
+        total_shuf_w = sum(e.get("totalShuffleWrite", 0) for e in executors)
+        peak_mem_exec = max((e.get("peakMemoryMetrics", {}).get("JVMHeapMemory", 0)
+                             for e in executors), default=0)
+        max_mem = sum(e.get("maxMemory", 0) for e in executors)
+
+        exec_summary = {
+            "active_cores": active_cores,
+            "total_tasks": total_tasks,
+            "total_gc_ms": total_gc_ms,
+            "gc_pct": round(total_gc_ms / max(1, total_dur_ms) * 100, 1),
+            "total_duration_ms": total_dur_ms,
+            "peak_memory_mb": round(peak_mem_exec / 1_048_576, 2),
+            "max_memory_mb": round(max_mem / 1_048_576, 2),
+            "total_input_mb": round(total_input / 1_048_576, 2),
+            "total_output_mb": round(total_output / 1_048_576, 2),
+            "total_shuffle_read_mb": round(total_shuf_r / 1_048_576, 2),
+            "total_shuffle_write_mb": round(total_shuf_w / 1_048_576, 2),
+        }
+
+    last_batch_rows = batch_details[-1]["rows"] if batch_details else 0
+    return {
+        "status": "completed",
+        "micro_batches_completed": len(batch_details),
+        "total_rows_processed": total_rows,
+        "last_batch_rows": last_batch_rows,
+        "first_update": None,
+        "last_update": None,
+        "batch_durations_ms": batch_durations_ms,
+        "transform_times_ms": transform_times_ms,
+        "delta_write_times_ms": delta_write_times_ms,
+        "batch_details": batch_details,
+        "executor": exec_summary,
     }
 
 
@@ -306,25 +317,42 @@ def _read_validation_json() -> dict:
     return {}
 
 
+def _read_generator_json() -> dict:
+    """Read generator metrics from the JSON sidecar file."""
+    try:
+        if GENERATOR_JSON_PATH.exists():
+            return json.loads(GENERATOR_JSON_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {
+        "status": "idle",
+        "start_time": None,
+        "target_bytes": 0,
+        "bytes_sent": 0,
+        "records_sent": 0,
+        "batches_completed": 0,
+        "elapsed_seconds": 0.0,
+        "throughput_mb_per_sec": 0.0,
+        "avg_batch_time_ms": 0.0,
+        "avg_publish_latency_ms": 0.0,
+        "batch_timings_ms": [],
+        "publish_latencies_ms": [],
+        "errors": 0,
+        "last_update": None,
+    }
+
+
 def get_metrics() -> dict:
     """Read the current metrics snapshot (same dict shape as before)."""
     with _lock:
-        conn = _get_conn()
-
-        g = conn.execute("SELECT * FROM generator_state WHERE id=1").fetchdf().iloc[0]
-        p = conn.execute("SELECT * FROM pipeline_state WHERE id=1").fetchdf().iloc[0]
-
-        # Delta tables
-        dt_rows = conn.execute("SELECT * FROM delta_tables").fetchdf()
+        # ── Delta tables: compute on-demand from deltalake ──
         delta = {}
-        for _, row in dt_rows.iterrows():
-            delta[f"{row['table_name']}_table"] = {
-                "version": int(row["version"]),
-                "num_files": int(row["num_files"]),
-                "row_count": int(row["row_count"]),
-                "size_bytes": int(row["size_bytes"]),
-                "last_update": _nan_to_none(row["last_update"]),
-            }
+        for table_name in _DELTA_TABLES:
+            stats = _read_delta_table_stats(table_name)
+            delta[f"{table_name}_table"] = stats
+
+        # ── Generator metrics: read from JSON sidecar ──
+        gen = _read_generator_json()
 
         # ── Spark metrics: read from JSON file (written by container) ──
         spark_data = _read_spark_json()
@@ -334,20 +362,20 @@ def get_metrics() -> dict:
 
         return {
             "generator": {
-                "status": g["status"],
-                "start_time": _nan_to_none(g["start_time"]),
-                "target_bytes": int(g["target_bytes"]),
-                "bytes_sent": int(g["bytes_sent"]),
-                "records_sent": int(g["records_sent"]),
-                "batches_completed": int(g["batches_completed"]),
-                "elapsed_seconds": float(g["elapsed_seconds"]),
-                "throughput_mb_per_sec": float(g["throughput_mb_per_sec"]),
-                "avg_batch_time_ms": float(g["avg_batch_time_ms"]),
-                "avg_publish_latency_ms": float(g["avg_publish_latency_ms"]),
-                "batch_timings_ms": _timings_list(conn, "generator_timings", "batch_time"),
-                "publish_latencies_ms": _timings_list(conn, "generator_timings", "publish_latency"),
-                "errors": int(g["errors"]),
-                "last_update": _nan_to_none(g["last_update"]),
+                "status": gen.get("status", "idle"),
+                "start_time": gen.get("start_time"),
+                "target_bytes": gen.get("target_bytes", 0),
+                "bytes_sent": gen.get("bytes_sent", 0),
+                "records_sent": gen.get("records_sent", 0),
+                "batches_completed": gen.get("batches_completed", 0),
+                "elapsed_seconds": gen.get("elapsed_seconds", 0.0),
+                "throughput_mb_per_sec": gen.get("throughput_mb_per_sec", 0.0),
+                "avg_batch_time_ms": gen.get("avg_batch_time_ms", 0.0),
+                "avg_publish_latency_ms": gen.get("avg_publish_latency_ms", 0.0),
+                "batch_timings_ms": gen.get("batch_timings_ms", []),
+                "publish_latencies_ms": gen.get("publish_latencies_ms", []),
+                "errors": gen.get("errors", 0),
+                "last_update": gen.get("last_update"),
             },
             "spark": {
                 "status": spark_data.get("status", "idle"),
@@ -367,12 +395,15 @@ def get_metrics() -> dict:
             },
             "delta": delta,
             "pipeline": {
-                "end_to_end_latency_ms": float(p["end_to_end_latency_ms"]),
-                "last_update": _nan_to_none(p["last_update"]),
+                "end_to_end_latency_ms": 0.0,
+                "last_update": None,
             },
             "rust": _build_engine_metrics(_read_rust_json()),
             "validation": _read_validation_json(),
         }
+
+
+# ── Legacy update functions (no-ops, kept for API compatibility) ──
 
 
 def update_generator_metrics(
@@ -389,56 +420,8 @@ def update_generator_metrics(
     publish_latency_ms: Optional[float] = None,
     errors: Optional[int] = None,
 ):
-    """Update generator metrics (called from data_generator threads)."""
-    with _lock:
-        conn = _get_conn()
-        now = time.time()
-
-        # Build SET clause dynamically for scalar fields
-        sets, params = [], []
-        for col, val in [
-            ("status", status),
-            ("start_time", start_time),
-            ("target_bytes", target_bytes),
-            ("bytes_sent", bytes_sent),
-            ("records_sent", records_sent),
-            ("batches_completed", batches_completed),
-            ("elapsed_seconds", elapsed_seconds),
-            ("throughput_mb_per_sec", throughput_mb_per_sec),
-            ("errors", errors),
-        ]:
-            if val is not None:
-                sets.append(f"{col} = ?")
-                params.append(val)
-
-        # Append rolling timing rows
-        if batch_time_ms is not None:
-            conn.execute(
-                "INSERT INTO generator_timings (category, value_ms, ts) VALUES (?, ?, ?)",
-                ["batch_time", round(batch_time_ms, 2), now],
-            )
-            _trim_timings(conn, "generator_timings", "batch_time")
-            avg = _timings_avg(conn, "generator_timings", "batch_time")
-            sets.append("avg_batch_time_ms = ?")
-            params.append(avg)
-
-        if publish_latency_ms is not None:
-            conn.execute(
-                "INSERT INTO generator_timings (category, value_ms, ts) VALUES (?, ?, ?)",
-                ["publish_latency", round(publish_latency_ms, 2), now],
-            )
-            _trim_timings(conn, "generator_timings", "publish_latency")
-            avg = _timings_avg(conn, "generator_timings", "publish_latency")
-            sets.append("avg_publish_latency_ms = ?")
-            params.append(avg)
-
-        sets.append("last_update = ?")
-        params.append(now)
-
-        conn.execute(
-            f"UPDATE generator_state SET {', '.join(sets)} WHERE id = 1",
-            params,
-        )
+    """No-op: generator writes its own JSON sidecar file."""
+    pass
 
 
 def update_spark_metrics(
@@ -449,64 +432,8 @@ def update_spark_metrics(
     delta_write_time_ms: Optional[float] = None,
     rows_processed: Optional[int] = None,
 ):
-    """Update Spark streaming metrics."""
-    with _lock:
-        conn = _get_conn()
-        now = time.time()
-
-        sets, params = [], []
-
-        if status is not None:
-            sets.append("status = ?")
-            params.append(status)
-
-        if batch_duration_ms is not None:
-            conn.execute(
-                "INSERT INTO spark_timings (category, value_ms, ts) VALUES (?, ?, ?)",
-                ["batch_duration", round(batch_duration_ms, 2), now],
-            )
-            _trim_timings(conn, "spark_timings", "batch_duration")
-            avg = _timings_avg(conn, "spark_timings", "batch_duration")
-            sets.append("micro_batches_completed = micro_batches_completed + 1")
-            sets.append("avg_batch_duration_ms = ?")
-            params.append(avg)
-
-        if transform_time_ms is not None:
-            conn.execute(
-                "INSERT INTO spark_timings (category, value_ms, ts) VALUES (?, ?, ?)",
-                ["transform_time", round(transform_time_ms, 2), now],
-            )
-            _trim_timings(conn, "spark_timings", "transform_time")
-            avg = _timings_avg(conn, "spark_timings", "transform_time")
-            sets.append("avg_transform_time_ms = ?")
-            params.append(avg)
-
-        if delta_write_time_ms is not None:
-            conn.execute(
-                "INSERT INTO spark_timings (category, value_ms, ts) VALUES (?, ?, ?)",
-                ["delta_write_time", round(delta_write_time_ms, 2), now],
-            )
-            _trim_timings(conn, "spark_timings", "delta_write_time")
-            avg = _timings_avg(conn, "spark_timings", "delta_write_time")
-            sets.append("avg_delta_write_time_ms = ?")
-            params.append(avg)
-
-        if rows_processed is not None:
-            sets.append("total_rows_processed = total_rows_processed + ?")
-            params.append(rows_processed)
-            sets.append("last_batch_rows = ?")
-            params.append(rows_processed)
-
-        if sets:
-            # Set first_update on the very first metrics call
-            sets.append("first_update = COALESCE(first_update, ?)")
-            params.append(now)
-            sets.append("last_update = ?")
-            params.append(now)
-            conn.execute(
-                f"UPDATE spark_state SET {', '.join(sets)} WHERE id = 1",
-                params,
-            )
+    """No-op: Spark writes its own JSON via metrics_bridge."""
+    pass
 
 
 def update_delta_metrics(
@@ -517,44 +444,10 @@ def update_delta_metrics(
     row_count: Optional[int] = None,
     size_bytes: Optional[int] = None,
 ):
-    """Update Delta table statistics."""
-    with _lock:
-        conn = _get_conn()
-        now = time.time()
-
-        # Ensure row exists
-        conn.execute(
-            "INSERT OR IGNORE INTO delta_tables (table_name) VALUES (?)",
-            [table_name],
-        )
-
-        sets, params = [], []
-        for col, val in [
-            ("version", version),
-            ("num_files", num_files),
-            ("row_count", row_count),
-            ("size_bytes", size_bytes),
-        ]:
-            if val is not None:
-                sets.append(f"{col} = ?")
-                params.append(val)
-
-        if sets:
-            sets.append("last_update = ?")
-            params.append(now)
-            params.append(table_name)
-            conn.execute(
-                f"UPDATE delta_tables SET {', '.join(sets)} WHERE table_name = ?",
-                params,
-            )
+    """No-op: delta stats are computed on-demand from deltalake."""
+    pass
 
 
 def update_pipeline_latency(latency_ms: float):
-    """Update end-to-end pipeline latency."""
-    with _lock:
-        conn = _get_conn()
-        now = time.time()
-        conn.execute(
-            "UPDATE pipeline_state SET end_to_end_latency_ms = ?, last_update = ? WHERE id = 1",
-            [round(latency_ms, 2), now],
-        )
+    """No-op: pipeline latency is not actively tracked."""
+    pass

@@ -8,6 +8,7 @@ Usage:
 """
 
 import logging
+import os
 import sys
 
 import click
@@ -71,8 +72,13 @@ def main(config_path, target_gb, batch_size, threads, bootstrap_servers, topic):
     kafka_cfg = cfg["kafka"]
     gen_cfg = cfg["generator"]
 
-    # CLI overrides take precedence
-    servers = bootstrap_servers or kafka_cfg["bootstrap_servers"]
+    # CLI overrides take precedence; inside Docker use the internal address
+    if bootstrap_servers:
+        servers = bootstrap_servers
+    elif os.environ.get("DASHBOARD_DOCKER") == "1":
+        servers = kafka_cfg.get("internal_bootstrap_servers", kafka_cfg["bootstrap_servers"])
+    else:
+        servers = kafka_cfg["bootstrap_servers"]
     topic_name = topic or kafka_cfg["topic"]
     target_bytes = int((target_gb or gen_cfg["target_bytes"] / 1e9) * 1e9)
     batch = batch_size or gen_cfg["batch_size"]

@@ -27,7 +27,8 @@ import streamlit as st
 import yaml
 
 # Ensure project root is importable
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_IN_DOCKER = os.environ.get("DASHBOARD_DOCKER") == "1"
+PROJECT_ROOT = Path("/app") if _IN_DOCKER else Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from dashboard.metrics import get_metrics, reset_metrics
@@ -53,7 +54,8 @@ def load_config() -> dict:
 def get_spark_cluster_status() -> dict:
     """Query Spark Master REST API for active applications and worker info."""
     try:
-        resp = requests.get("http://localhost:8080/json/", timeout=3)
+        spark_host = os.environ.get("SPARK_MASTER_HOST", "localhost")
+        resp = requests.get(f"http://{spark_host}:8080/json/", timeout=3)
         data = resp.json()
         active_apps = data.get("activeapps", [])
         return {
@@ -91,23 +93,25 @@ def get_delta_table_info(table_path: str) -> dict:
     """Safely read Delta table metadata using deltalake library."""
     try:
         from deltalake import DeltaTable
+        import pyarrow as pa
         p = Path(table_path)
         if not p.exists():
             return None
         dt = DeltaTable(str(p))
-        file_uris = dt.file_uris()
-        total_size = sum(
-            os.path.getsize(f.replace("file://", "")) for f in file_uris
-            if os.path.exists(f.replace("file://", ""))
-        )
-        arrow_table = dt.to_pyarrow_table()
+        # Get row count, file count, and sizes from metadata (no per-file stat calls)
+        arro3_table = dt.get_add_actions(flatten=True)
+        add_actions = pa.table(arro3_table).to_pydict()
+        row_count = sum(add_actions.get("num_records", [0]))
+        total_size = sum(add_actions.get("size_bytes", [0]))
+        num_files = len(add_actions.get("path", []))
+        schema = dt.schema().to_arrow()
         return {
             "version": dt.version(),
-            "num_files": len(file_uris),
-            "row_count": arrow_table.num_rows,
-            "columns": arrow_table.num_columns,
+            "num_files": num_files,
+            "row_count": row_count,
+            "columns": len(schema),
             "size_bytes": total_size,
-            "schema": dt.schema().to_arrow(),
+            "schema": schema,
             "partition_columns": dt.metadata().partition_columns,
         }
     except Exception as e:
@@ -291,7 +295,9 @@ elif page == "🚀 Data Generator":
         submitted = st.form_submit_button("🚀 Start Data Generation", type="primary")
 
     if submitted:
-        reset_metrics()
+        # Delete stale generator metrics so the UI shows fresh progress
+        gen_json = PROJECT_ROOT / "logs" / "generator_metrics.json"
+        gen_json.unlink(missing_ok=True)
         cmd = [
             sys.executable, "-m", "data_generator.run",
             "--target-gb", str(target_gb),
@@ -315,7 +321,9 @@ elif page == "🚀 Data Generator":
     metrics = get_metrics()
     gen = metrics["generator"]
 
-    if gen["status"] == "running":
+    _gen_is_running = gen["status"] == "running"
+
+    if _gen_is_running:
         if gen["target_bytes"] > 0:
             progress = min(1.0, gen["bytes_sent"] / gen["target_bytes"])
             st.progress(progress, text=f"{progress * 100:.1f}%")
@@ -360,6 +368,11 @@ elif page == "🚀 Data Generator":
     st.markdown("---")
     if st.button("🗑️ Reset Metrics"):
         reset_metrics()
+        st.rerun()
+
+    # ── Auto-refresh while generator is running ───────────
+    if _gen_is_running:
+        time.sleep(2)
         st.rerun()
 
 
@@ -456,12 +469,13 @@ elif page == "⚙️ Spark Jobs":
         # 1. Kill the app via Spark Master REST API
         try:
             cluster = get_spark_cluster_status()
+            spark_host = os.environ.get("SPARK_MASTER_HOST", "localhost")
             if cluster["reachable"]:
-                resp = requests.get("http://localhost:8080/json/", timeout=3)
+                resp = requests.get(f"http://{spark_host}:8080/json/", timeout=3)
                 for app in resp.json().get("activeapps", []):
                     app_name_lower = app["name"].lower()
                     if name.replace("_", "") in app_name_lower.replace("_", ""):
-                        requests.post(f"http://localhost:8080/app/kill/?id={app['id']}", timeout=5)
+                        requests.post(f"http://{spark_host}:8080/app/kill/?id={app['id']}", timeout=5)
         except Exception:
             pass
 
@@ -710,6 +724,44 @@ elif page == "⚙️ Spark Jobs":
             time.sleep(0.5)
             st.rerun()
 
+    # ── Live Pipeline Metrics ─────────────────────────────
+    st.markdown("---")
+    st.subheader("📊 Live Pipeline Metrics")
+
+    _jobs_metrics = get_metrics()
+    _spark_m = _jobs_metrics["spark"]
+    _rust_m = _jobs_metrics.get("rust", {})
+
+    _any_job_running = any(
+        _check_proc(k) == "running"
+        for k in list(SPARK_JOBS.keys()) + list(RUST_JOBS.keys())
+    )
+
+    if _spark_m.get("micro_batches_completed", 0) > 0 or _rust_m.get("micro_batches_completed", 0) > 0:
+        col_s, col_r = st.columns(2)
+        with col_s:
+            st.markdown("**⚡ Spark Pipeline**")
+            s_status = _spark_m.get("status", "idle")
+            s_icon = {"running": "🟢", "idle": "⚪", "completed": "✅"}.get(s_status, "🔴")
+            st.write(f"Status: {s_icon} **{s_status.upper()}**")
+            ss1, ss2, ss3 = st.columns(3)
+            ss1.metric("Batches", f"{_spark_m['micro_batches_completed']:,}")
+            ss2.metric("Rows", f"{_spark_m['total_rows_processed']:,}")
+            ss3.metric("Avg Batch", f"{_spark_m['avg_batch_duration_ms']:.0f} ms")
+        with col_r:
+            st.markdown("**🦀 Rust Pipeline**")
+            r_status = _rust_m.get("status", "idle")
+            r_icon = {"running": "🟢", "idle": "⚪", "completed": "✅"}.get(r_status, "🔴")
+            st.write(f"Status: {r_icon} **{r_status.upper()}**")
+            rr1, rr2, rr3 = st.columns(3)
+            rr1.metric("Batches", f"{_rust_m.get('micro_batches_completed', 0):,}")
+            rr2.metric("Rows", f"{_rust_m.get('total_rows_processed', 0):,}")
+            rr3.metric("Avg Batch", f"{_rust_m.get('avg_batch_duration_ms', 0):.0f} ms")
+    elif _any_job_running:
+        st.info("Pipeline jobs are running — metrics will appear after the first batch completes.")
+    else:
+        st.info("Start a pipeline job above to see live metrics.")
+
     # ── Pipeline Reset ────────────────────────────────────
     st.markdown("---")
     st.subheader("🔄 Pipeline Reset")
@@ -846,6 +898,11 @@ elif page == "⚙️ Spark Jobs":
             else:
                 st.error("Type exactly: `FULL RESET`")
 
+    # ── Auto-refresh while any pipeline job is running ────
+    if _any_job_running:
+        time.sleep(3)
+        st.rerun()
+
 
 # ══════════════════════════════════════════════════════════════
 # PAGE: Delta Explorer
@@ -895,7 +952,7 @@ elif page == "🔍 Delta Explorer":
                 "Type": str(field.type),
                 "Nullable": field.nullable,
             })
-        st.dataframe(pd.DataFrame(schema_data), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(schema_data), width="stretch", hide_index=True)
 
         # ── Sample Data ───────────────────────────────────
         st.subheader("Sample Data")
@@ -904,7 +961,7 @@ elif page == "🔍 Delta Explorer":
             from deltalake import DeltaTable
             dt = DeltaTable(table_path)
             sample_df = dt.to_pandas().head(num_rows)
-            st.dataframe(sample_df, use_container_width=True)
+            st.dataframe(sample_df, width="stretch")
         except Exception as e:
             st.error(f"Error loading sample: {e}")
 
@@ -949,7 +1006,7 @@ elif page == "🔍 Delta Explorer":
                 with st.spinner("Running query..."):
                     result_df = query_delta_table(table_path, sql_input.strip())
                 if not result_df.empty:
-                    st.dataframe(result_df, use_container_width=True)
+                    st.dataframe(result_df, width="stretch")
                     st.caption(f"{len(result_df)} rows returned")
                 else:
                     st.info("Query returned no results")
@@ -965,7 +1022,7 @@ elif page == "🔍 Delta Explorer":
             if history:
                 hist_df = pd.DataFrame(history)
                 display_cols = [c for c in ["version", "timestamp", "operation", "operationParameters"] if c in hist_df.columns]
-                st.dataframe(hist_df[display_cols].head(20), use_container_width=True)
+                st.dataframe(hist_df[display_cols].head(20), width="stretch")
             else:
                 st.info("No history available")
         except Exception as e:
@@ -1016,6 +1073,28 @@ elif page == "📈 Performance":
     metrics = get_metrics()
     gen = metrics["generator"]
     spark = metrics["spark"]
+    rust = metrics.get("rust", {})
+
+    # ── Quick Spark vs Rust Summary (always visible at top) ──
+    _rs = rust.get("micro_batches_completed", 0)
+    _ss = spark.get("micro_batches_completed", 0)
+    if _rs > 0 or _ss > 0:
+        st.markdown("---")
+        st.subheader("🦀 Spark vs Rust — Quick Summary")
+        _qs1, _qs2, _qs3 = st.columns(3)
+        _qs1.metric("Spark Batches", f"{_ss:,}")
+        _qs2.metric("Rust Batches", f"{_rs:,}")
+        _spark_avg = spark.get("avg_batch_duration_ms", 0)
+        _rust_bd = rust.get("batch_details", [])
+        _rust_avg = (sum(b.get("wall_ms", 0) for b in _rust_bd) / len(_rust_bd)) if _rust_bd else 0
+        if _spark_avg > 0 and _rust_avg > 0:
+            _ratio = _spark_avg / _rust_avg
+            _qs3.metric("Rust Speedup", f"{_ratio:.1f}x",
+                        delta=f"{'Rust' if _ratio > 1 else 'Spark'} faster")
+        else:
+            _qs3.metric("Rust Speedup", "—")
+        st.info("📊 Scroll down to **'Comprehensive Batch Run Statistics'** for the full comparison table with per-category winners.")
+        st.markdown("---")
 
     # ── Generator Performance ─────────────────────────────
     st.subheader("🔧 Data Generator Performance")
@@ -1032,14 +1111,14 @@ elif page == "📈 Performance":
             st.caption("Batch Production Time (ms) — per batch")
             st.line_chart(
                 pd.DataFrame({"batch_time_ms": gen["batch_timings_ms"]}),
-                use_container_width=True,
+                width="stretch",
             )
         with col2:
             st.caption("Kafka Publish Latency (ms) — flush() time")
             if gen["publish_latencies_ms"]:
                 st.line_chart(
                     pd.DataFrame({"publish_latency_ms": gen["publish_latencies_ms"]}),
-                    use_container_width=True,
+                    width="stretch",
                 )
 
         # Distribution summary
@@ -1055,7 +1134,7 @@ elif page == "📈 Performance":
             "Max": [batch_series.max(), pub_series.max()],
             "Avg": [batch_series.mean(), pub_series.mean()],
         }).round(2)
-        st.dataframe(summary, use_container_width=True, hide_index=True)
+        st.dataframe(summary, width="stretch", hide_index=True)
     else:
         st.info("No generator timing data yet. Start a data generation run.")
 
@@ -1120,21 +1199,21 @@ elif page == "📈 Performance":
             st.caption("Micro-batch Duration (ms)")
             st.line_chart(
                 pd.DataFrame({"duration_ms": spark["batch_durations_ms"]}),
-                use_container_width=True,
+                width="stretch",
             )
         with col2:
             st.caption("Transform Time (ms)")
             if spark["transform_times_ms"]:
                 st.line_chart(
                     pd.DataFrame({"transform_ms": spark["transform_times_ms"]}),
-                    use_container_width=True,
+                    width="stretch",
                 )
         with col3:
             st.caption("Delta Write Time (ms)")
             if spark["delta_write_times_ms"]:
                 st.line_chart(
                     pd.DataFrame({"write_ms": spark["delta_write_times_ms"]}),
-                    use_container_width=True,
+                    width="stretch",
                 )
 
         # Spark distribution summary
@@ -1151,7 +1230,7 @@ elif page == "📈 Performance":
             "Max": [batch_s.max(), transform_s.max(), write_s.max()],
             "Avg": [batch_s.mean(), transform_s.mean(), write_s.mean()],
         }).round(2)
-        st.dataframe(spark_summary, use_container_width=True, hide_index=True)
+        st.dataframe(spark_summary, width="stretch", hide_index=True)
 
         # ── Transform vs Write Breakdown ──────────────────
         st.markdown("")
@@ -1164,7 +1243,7 @@ elif page == "📈 Performance":
                 "Transform (ms)": spark["transform_times_ms"][:n],
                 "Delta Write (ms)": spark["delta_write_times_ms"][:n],
             })
-            st.area_chart(breakdown_df, use_container_width=True)
+            st.area_chart(breakdown_df, width="stretch")
 
             # Totals
             tc1, tc2, tc3 = st.columns(3)
@@ -1234,7 +1313,7 @@ elif page == "📈 Performance":
                     "tasks": "Tasks",
                 }
                 show_df = detail_df[available].rename(columns=rename_map)
-                st.dataframe(show_df, use_container_width=True, hide_index=True)
+                st.dataframe(show_df, width="stretch", hide_index=True)
 
             # Charts for CPU, GC, Memory across batches
             ch1, ch2, ch3 = st.columns(3)
@@ -1242,15 +1321,15 @@ elif page == "📈 Performance":
                 st.caption("CPU Time vs GC Time (ms)")
                 if "cpu_ms" in detail_df.columns and "gc_ms" in detail_df.columns:
                     st.bar_chart(detail_df[["cpu_ms", "gc_ms"]].rename(
-                        columns={"cpu_ms": "CPU", "gc_ms": "GC"}), use_container_width=True)
+                        columns={"cpu_ms": "CPU", "gc_ms": "GC"}), width="stretch")
             with ch2:
                 st.caption("CPU Utilization (%)")
                 if "cpu_util_pct" in detail_df.columns:
-                    st.line_chart(detail_df["cpu_util_pct"], use_container_width=True)
+                    st.line_chart(detail_df["cpu_util_pct"], width="stretch")
             with ch3:
                 st.caption("Peak Memory (MB)")
                 if "peak_memory_mb" in detail_df.columns:
-                    st.area_chart(detail_df["peak_memory_mb"], use_container_width=True)
+                    st.area_chart(detail_df["peak_memory_mb"], width="stretch")
 
             # Shuffle charts
             if "shuffle_read_mb" in detail_df.columns:
@@ -1259,12 +1338,12 @@ elif page == "📈 Performance":
                     st.caption("Shuffle I/O (MB)")
                     st.bar_chart(detail_df[["shuffle_read_mb", "shuffle_write_mb"]].rename(
                         columns={"shuffle_read_mb": "Read", "shuffle_write_mb": "Write"}),
-                        use_container_width=True)
+                        width="stretch")
                 with sc2:
                     st.caption("I/O (MB)")
                     st.bar_chart(detail_df[["input_mb", "output_mb"]].rename(
                         columns={"input_mb": "Input", "output_mb": "Output"}),
-                        use_container_width=True)
+                        width="stretch")
 
             # Migration evaluation summary
             if len(batch_details) >= 2:
@@ -1300,69 +1379,412 @@ elif page == "📈 Performance":
     else:
         st.info("No Spark metrics yet. Run the streaming job to collect data.")
 
-    # ── Spark vs Rust Comparison ──────────────────────────
+    # ── Delta Table Statistics (always visible) ─────────────
     st.markdown("---")
-    st.subheader("🦀 Spark vs Rust Comparison")
+    st.subheader("📁 Delta Table Statistics")
+
+    _all_tables = {
+        "Transactions (Spark)": cfg["delta"]["table_path"],
+        "Transactions (Rust)": cfg.get("rust", {}).get("local_delta_output", "./delta_output/financial_transactions_rust"),
+        "Accounts (Spark)": cfg["delta"]["accounts_table_path"],
+        "Accounts (Rust)": cfg.get("rust", {}).get("local_accounts_delta_output", "./delta_output/accounts_rust"),
+    }
+
+    table_stats = {}
+    for label, path in _all_tables.items():
+        info = get_delta_table_info(path)
+        if info and "error" not in info:
+            table_stats[label] = info
+
+    if table_stats:
+        cols = st.columns(len(table_stats))
+        for i, (label, info) in enumerate(table_stats.items()):
+            with cols[i]:
+                engine = "🦀" if "Rust" in label else "⚡"
+                st.markdown(f"**{engine} {label}**")
+                st.metric("Rows", f"{info['row_count']:,}")
+                st.metric("Files", f"{info['num_files']:,}")
+                st.metric("Size", fmt_bytes(info["size_bytes"]))
+                st.metric("Version", info["version"])
+                if info.get("partition_columns"):
+                    st.caption(f"Partitions: {', '.join(info['partition_columns'])}")
+
+        # ── Schema Comparison ─────────────────────────────
+        spark_txn = table_stats.get("Transactions (Spark)")
+        rust_txn = table_stats.get("Transactions (Rust)")
+        if spark_txn and rust_txn:
+            st.markdown("##### 📋 Schema Comparison: Transactions")
+            spark_cols = {f.name: str(f.type) for f in spark_txn["schema"]}
+            rust_cols = {f.name: str(f.type) for f in rust_txn["schema"]}
+            all_cols = sorted(set(spark_cols.keys()) | set(rust_cols.keys()))
+            schema_rows = []
+            for col in all_cols:
+                s_type = spark_cols.get(col, "—")
+                r_type = rust_cols.get(col, "—")
+                match = "✅" if s_type == r_type else ("⚠️" if s_type != "—" and r_type != "—" else "❌")
+                schema_rows.append({"Column": col, "Spark Type": s_type, "Rust Type": r_type, "Match": match})
+            st.dataframe(pd.DataFrame(schema_rows), width="stretch", hide_index=True)
+
+        # ── Row Count Parity ─────────────────────────────
+        pairs = [("Transactions (Spark)", "Transactions (Rust)"), ("Accounts (Spark)", "Accounts (Rust)")]
+        parity_rows = []
+        for spark_label, rust_label in pairs:
+            si = table_stats.get(spark_label)
+            ri = table_stats.get(rust_label)
+            if si or ri:
+                spark_rc = si["row_count"] if si else 0
+                rust_rc = ri["row_count"] if ri else 0
+                diff = abs(spark_rc - rust_rc)
+                pct = (min(spark_rc, rust_rc) / max(spark_rc, rust_rc) * 100) if max(spark_rc, rust_rc) > 0 else 0
+                status = "✅ Match" if diff == 0 else (f"⚠️ Δ{diff:,}" if pct > 95 else f"❌ Δ{diff:,}")
+                parity_rows.append({
+                    "Table": spark_label.replace(" (Spark)", ""),
+                    "Spark Rows": f"{spark_rc:,}" if si else "—",
+                    "Rust Rows": f"{rust_rc:,}" if ri else "—",
+                    "Parity": f"{pct:.1f}%",
+                    "Status": status,
+                })
+        if parity_rows:
+            st.markdown("##### 🔄 Row Count Parity")
+            st.dataframe(pd.DataFrame(parity_rows), width="stretch", hide_index=True)
+
+        # ── Data Sample Comparison ────────────────────────
+        if rust_txn:
+            with st.expander("🔍 Sample Data Comparison (Transactions)"):
+                try:
+                    from deltalake import DeltaTable
+                    sample_dfs = {}
+                    for label, path in [("Spark", cfg["delta"]["table_path"]),
+                                         ("Rust", cfg.get("rust", {}).get("local_delta_output", ""))]:
+                        try:
+                            dt = DeltaTable(path)
+                            sample_dfs[label] = dt.to_pyarrow_dataset().head(5).to_pandas()
+                        except Exception:
+                            pass
+                    if sample_dfs:
+                        for label, df in sample_dfs.items():
+                            st.caption(f"**{label}** (first 5 rows)")
+                            st.dataframe(df, width="stretch")
+                except Exception as e:
+                    st.error(f"Error loading samples: {e}")
+    else:
+        st.info("No Delta tables found. Run the pipeline to generate data.")
+
+    # ── Spark vs Rust Runtime Comparison ──────────────────
+    st.markdown("---")
+    st.subheader("🦀 Spark vs Rust — Batch Run Statistics")
 
     rust = metrics.get("rust", {})
     validation = metrics.get("validation", {})
 
-    if rust.get("micro_batches_completed", 0) > 0:
-        st.markdown("##### ⚡ Head-to-Head Metrics")
-        cmp1, cmp2 = st.columns(2)
-        with cmp1:
-            st.markdown("**Spark**")
-            st.metric("Batches", f"{spark['micro_batches_completed']:,}")
-            st.metric("Rows Processed", f"{spark['total_rows_processed']:,}")
-            st.metric("Avg Batch Duration", f"{spark['avg_batch_duration_ms']:.0f} ms")
-            st.metric("Avg Transform Time", f"{spark['avg_transform_time_ms']:.0f} ms")
-            st.metric("Avg Delta Write Time", f"{spark['avg_delta_write_time_ms']:.0f} ms")
-            spark_gc_ms = sum(d.get("gc_ms", 0) for d in spark.get("batch_details", []))
-            st.metric("Total GC Time", f"{spark_gc_ms:,.0f} ms")
-        with cmp2:
-            st.markdown("**Rust**")
-            st.metric("Batches", f"{rust.get('micro_batches_completed', 0):,}")
-            st.metric("Rows Processed", f"{rust.get('total_rows_processed', 0):,}")
-            st.metric("Avg Batch Duration", f"{rust.get('avg_batch_duration_ms', 0):.0f} ms")
-            st.metric("Avg Transform Time", f"{rust.get('avg_transform_time_ms', 0):.0f} ms")
-            st.metric("Avg Delta Write Time", f"{rust.get('avg_delta_write_time_ms', 0):.0f} ms")
-            st.metric("Total GC Time", "0 ms *(no GC)*")
+    # Helper: compute per-engine stats from batch_details
+    def _engine_stats(engine_data: dict, label: str) -> dict:
+        """Build a comprehensive stats dict from engine metrics."""
+        bd = engine_data.get("batch_details", [])
+        durations = engine_data.get("batch_durations_ms", [])
+        transforms = engine_data.get("transform_times_ms", [])
+        writes = engine_data.get("delta_write_times_ms", [])
+        executor = engine_data.get("executor", {})
 
-        # Speedup metric
-        if spark['avg_batch_duration_ms'] > 0 and rust.get('avg_batch_duration_ms', 0) > 0:
-            speedup = spark['avg_batch_duration_ms'] / rust['avg_batch_duration_ms']
+        total_wall_ms = sum(d.get("wall_ms", 0) for d in bd) if bd else sum(durations)
+        total_transform_ms = sum(d.get("transform_ms", d.get("cpu_ms", 0)) for d in bd) if bd else sum(transforms)
+        total_write_ms = sum(d.get("write_ms", 0) for d in bd) if bd else sum(writes)
+        total_rows = engine_data.get("total_rows_processed", 0)
+        n_batches = engine_data.get("micro_batches_completed", 0)
+
+        # Kafka read time = wall time - transform - write (approximate)
+        total_kafka_ms = max(0, total_wall_ms - total_transform_ms - total_write_ms)
+
+        avg_cpu_util = 0.0
+        avg_peak_mem = 0.0
+        total_gc_ms = 0.0
+        total_shuffle_read = 0.0
+        total_shuffle_write = 0.0
+        active_cores = executor.get("active_cores", 0)
+        total_tasks = executor.get("total_tasks", 0)
+
+        if bd:
+            cpu_utils = [d.get("cpu_util_pct", 0) for d in bd if d.get("cpu_util_pct") is not None]
+            avg_cpu_util = sum(cpu_utils) / len(cpu_utils) if cpu_utils else 0.0
+            mems = [d.get("peak_memory_mb", 0) for d in bd if d.get("peak_memory_mb") is not None]
+            avg_peak_mem = sum(mems) / len(mems) if mems else 0.0
+            total_gc_ms = sum(d.get("gc_ms", 0) for d in bd)
+            total_shuffle_read = sum(d.get("shuffle_read_mb", 0) for d in bd)
+            total_shuffle_write = sum(d.get("shuffle_write_mb", 0) for d in bd)
+            if not active_cores:
+                tasks_list = [d.get("tasks", 0) for d in bd if d.get("tasks")]
+                active_cores = max(tasks_list) if tasks_list else 0
+            if not total_tasks:
+                total_tasks = sum(d.get("tasks", 0) for d in bd)
+
+        throughput = (total_rows / (total_wall_ms / 1000)) if total_wall_ms > 0 else 0
+
+        return {
+            "n_batches": n_batches,
+            "total_rows": total_rows,
+            "total_wall_ms": total_wall_ms,
+            "total_transform_ms": total_transform_ms,
+            "total_write_ms": total_write_ms,
+            "total_kafka_ms": total_kafka_ms,
+            "avg_batch_ms": (total_wall_ms / n_batches) if n_batches else 0,
+            "avg_transform_ms": (total_transform_ms / n_batches) if n_batches else 0,
+            "avg_write_ms": (total_write_ms / n_batches) if n_batches else 0,
+            "avg_kafka_ms": (total_kafka_ms / n_batches) if n_batches else 0,
+            "avg_cpu_util": avg_cpu_util,
+            "avg_peak_mem_mb": avg_peak_mem,
+            "total_gc_ms": total_gc_ms,
+            "gc_pct": (total_gc_ms / total_wall_ms * 100) if total_wall_ms > 0 else 0,
+            "total_shuffle_read_mb": total_shuffle_read,
+            "total_shuffle_write_mb": total_shuffle_write,
+            "active_cores": active_cores,
+            "total_tasks": total_tasks,
+            "throughput_rows_sec": throughput,
+        }
+
+    spark_s = _engine_stats(spark, "Spark")
+    rust_s = _engine_stats(rust, "Rust")
+
+    has_spark = spark_s["n_batches"] > 0
+    has_rust = rust_s["n_batches"] > 0
+
+    if has_spark or has_rust:
+
+        # ── Speedup Banner ────────────────────────────────
+        if has_spark and has_rust and spark_s["avg_batch_ms"] > 0 and rust_s["avg_batch_ms"] > 0:
+            speedup = spark_s["avg_batch_ms"] / rust_s["avg_batch_ms"]
             delta_label = (f"{(speedup - 1) * 100:.0f}% faster"
                            if speedup > 1
                            else f"{(1 - speedup) * 100:.0f}% slower")
-            st.metric("🏎️ Rust Speedup", f"{speedup:.2f}x", delta=delta_label)
+            st.metric("🏎️ Rust Batch Speedup", f"{speedup:.2f}x", delta=delta_label)
 
-        # Batch duration overlay chart
+        # ── Comprehensive Statistics Table ────────────────
+        st.markdown("##### 📊 Comprehensive Batch Run Statistics")
+
+        def _fmt_ms(v):
+            if v >= 60000:
+                return f"{v / 60000:.1f} min"
+            if v >= 1000:
+                return f"{v / 1000:.1f} s"
+            return f"{v:.1f} ms"
+
+        def _fmt_val(v, fmt="ms"):
+            if fmt == "ms":
+                return _fmt_ms(v) if v else "—"
+            if fmt == "int":
+                return f"{int(v):,}" if v else "—"
+            if fmt == "pct":
+                return f"{v:.1f}%" if v else "—"
+            if fmt == "mb":
+                return f"{v:.1f} MB" if v else "—"
+            if fmt == "rows_sec":
+                return f"{v:,.0f}" if v else "—"
+            return str(v) if v else "—"
+
+        def _winner(s_val, r_val, metric_type="lower_better"):
+            """Determine winner. lower_better for times, higher_better for throughput."""
+            if not s_val or not r_val:
+                return "—"
+            if metric_type == "lower_better":
+                return "🦀 Rust" if r_val < s_val else ("⚡ Spark" if s_val < r_val else "Tie")
+            else:
+                return "🦀 Rust" if r_val > s_val else ("⚡ Spark" if s_val > r_val else "Tie")
+
+        # Build the rows
+        stats_rows = [
+            # ── Batch Overview ──
+            {"Category": "📋 Batch Overview", "Metric": "Total Batches Completed",
+             "Spark (⚡)": _fmt_val(spark_s["n_batches"], "int"),
+             "Rust (🦀)": _fmt_val(rust_s["n_batches"], "int"), "Winner": "—"},
+            {"Category": "", "Metric": "Total Rows Processed",
+             "Spark (⚡)": _fmt_val(spark_s["total_rows"], "int"),
+             "Rust (🦀)": _fmt_val(rust_s["total_rows"], "int"), "Winner": "—"},
+            {"Category": "", "Metric": "Throughput (rows/sec)",
+             "Spark (⚡)": _fmt_val(spark_s["throughput_rows_sec"], "rows_sec"),
+             "Rust (🦀)": _fmt_val(rust_s["throughput_rows_sec"], "rows_sec"),
+             "Winner": _winner(spark_s["throughput_rows_sec"], rust_s["throughput_rows_sec"], "higher_better")},
+
+            # ── End-to-End Timing ──
+            {"Category": "⏱️ End-to-End Timing", "Metric": "Total Batch Wall-Clock Time",
+             "Spark (⚡)": _fmt_val(spark_s["total_wall_ms"]),
+             "Rust (🦀)": _fmt_val(rust_s["total_wall_ms"]),
+             "Winner": _winner(spark_s["total_wall_ms"], rust_s["total_wall_ms"])},
+            {"Category": "", "Metric": "Avg Batch Duration",
+             "Spark (⚡)": _fmt_val(spark_s["avg_batch_ms"]),
+             "Rust (🦀)": _fmt_val(rust_s["avg_batch_ms"]),
+             "Winner": _winner(spark_s["avg_batch_ms"], rust_s["avg_batch_ms"])},
+
+            # ── Kafka Read ──
+            {"Category": "📨 Kafka Read", "Metric": "Total Kafka Read Time",
+             "Spark (⚡)": _fmt_val(spark_s["total_kafka_ms"]),
+             "Rust (🦀)": _fmt_val(rust_s["total_kafka_ms"]),
+             "Winner": _winner(spark_s["total_kafka_ms"], rust_s["total_kafka_ms"])},
+            {"Category": "", "Metric": "Avg Kafka Read / Batch",
+             "Spark (⚡)": _fmt_val(spark_s["avg_kafka_ms"]),
+             "Rust (🦀)": _fmt_val(rust_s["avg_kafka_ms"]),
+             "Winner": _winner(spark_s["avg_kafka_ms"], rust_s["avg_kafka_ms"])},
+
+            # ── Transform ──
+            {"Category": "🔄 Transform (CPU)", "Metric": "Total Transform Time",
+             "Spark (⚡)": _fmt_val(spark_s["total_transform_ms"]),
+             "Rust (🦀)": _fmt_val(rust_s["total_transform_ms"]),
+             "Winner": _winner(spark_s["total_transform_ms"], rust_s["total_transform_ms"])},
+            {"Category": "", "Metric": "Avg Transform / Batch",
+             "Spark (⚡)": _fmt_val(spark_s["avg_transform_ms"]),
+             "Rust (🦀)": _fmt_val(rust_s["avg_transform_ms"]),
+             "Winner": _winner(spark_s["avg_transform_ms"], rust_s["avg_transform_ms"])},
+
+            # ── Delta Lake Write ──
+            {"Category": "💾 Delta Lake Write", "Metric": "Total Delta Write Time",
+             "Spark (⚡)": _fmt_val(spark_s["total_write_ms"]),
+             "Rust (🦀)": _fmt_val(rust_s["total_write_ms"]),
+             "Winner": _winner(spark_s["total_write_ms"], rust_s["total_write_ms"])},
+            {"Category": "", "Metric": "Avg Delta Write / Batch",
+             "Spark (⚡)": _fmt_val(spark_s["avg_write_ms"]),
+             "Rust (🦀)": _fmt_val(rust_s["avg_write_ms"]),
+             "Winner": _winner(spark_s["avg_write_ms"], rust_s["avg_write_ms"])},
+
+            # ── Memory Footprint ──
+            {"Category": "🧠 Memory Footprint", "Metric": "Avg Peak Memory / Batch",
+             "Spark (⚡)": _fmt_val(spark_s["avg_peak_mem_mb"], "mb"),
+             "Rust (🦀)": _fmt_val(rust_s["avg_peak_mem_mb"], "mb"),
+             "Winner": _winner(spark_s["avg_peak_mem_mb"], rust_s["avg_peak_mem_mb"])},
+            {"Category": "", "Metric": "Memory Efficiency (rows/GB)",
+             "Spark (⚡)": f"{spark_s['total_rows'] / max(1, spark_s['avg_peak_mem_mb']) * 1000:.0f}" if spark_s["avg_peak_mem_mb"] else "—",
+             "Rust (🦀)": f"{rust_s['total_rows'] / max(1, rust_s['avg_peak_mem_mb']) * 1000:.0f}" if rust_s["avg_peak_mem_mb"] else "—",
+             "Winner": _winner(
+                 spark_s['total_rows'] / max(1, spark_s['avg_peak_mem_mb']) if spark_s["avg_peak_mem_mb"] else 0,
+                 rust_s['total_rows'] / max(1, rust_s['avg_peak_mem_mb']) if rust_s["avg_peak_mem_mb"] else 0,
+                 "higher_better")},
+
+            # ── CPU Utilization ──
+            {"Category": "⚙️ CPU Utilization", "Metric": "Avg CPU Utilization",
+             "Spark (⚡)": _fmt_val(spark_s["avg_cpu_util"], "pct"),
+             "Rust (🦀)": _fmt_val(rust_s["avg_cpu_util"], "pct"),
+             "Winner": _winner(spark_s["avg_cpu_util"], rust_s["avg_cpu_util"], "higher_better")},
+            {"Category": "", "Metric": "Active Cores / Threads",
+             "Spark (⚡)": _fmt_val(spark_s["active_cores"], "int"),
+             "Rust (🦀)": _fmt_val(rust_s["active_cores"], "int"), "Winner": "—"},
+
+            # ── Thread Pool / Task Utilization ──
+            {"Category": "🧵 Thread Pool", "Metric": "Total Tasks Executed",
+             "Spark (⚡)": _fmt_val(spark_s["total_tasks"], "int"),
+             "Rust (🦀)": _fmt_val(rust_s["total_tasks"], "int"), "Winner": "—"},
+            {"Category": "", "Metric": "Avg Tasks / Batch",
+             "Spark (⚡)": f"{spark_s['total_tasks'] / max(1, spark_s['n_batches']):.0f}" if spark_s["n_batches"] else "—",
+             "Rust (🦀)": f"{rust_s['total_tasks'] / max(1, rust_s['n_batches']):.0f}" if rust_s["n_batches"] else "—",
+             "Winner": "—"},
+
+            # ── GC / Pause Time ──
+            {"Category": "🗑️ GC / Pause Time", "Metric": "Total GC Time",
+             "Spark (⚡)": _fmt_val(spark_s["total_gc_ms"]),
+             "Rust (🦀)": "0 ms (no GC)",
+             "Winner": "🦀 Rust" if spark_s["total_gc_ms"] > 0 else "Tie"},
+            {"Category": "", "Metric": "GC Overhead (% of wall time)",
+             "Spark (⚡)": _fmt_val(spark_s["gc_pct"], "pct"),
+             "Rust (🦀)": "0.0%",
+             "Winner": "🦀 Rust" if spark_s["gc_pct"] > 0 else "Tie"},
+
+            # ── Shuffle (Spark-specific) ──
+            {"Category": "🔀 Shuffle (Spark)", "Metric": "Total Shuffle Read",
+             "Spark (⚡)": _fmt_val(spark_s["total_shuffle_read_mb"], "mb"),
+             "Rust (🦀)": "N/A (no shuffle)",
+             "Winner": "🦀 Rust" if spark_s["total_shuffle_read_mb"] > 0 else "—"},
+            {"Category": "", "Metric": "Total Shuffle Write",
+             "Spark (⚡)": _fmt_val(spark_s["total_shuffle_write_mb"], "mb"),
+             "Rust (🦀)": "N/A (no shuffle)",
+             "Winner": "🦀 Rust" if spark_s["total_shuffle_write_mb"] > 0 else "—"},
+
+            # ── Serialization Overhead ──
+            {"Category": "📦 Serialization", "Metric": "Serialization Model",
+             "Spark (⚡)": "Catalyst → Tungsten binary",
+             "Rust (🦀)": "serde → Arrow IPC (zero-copy)", "Winner": "—"},
+            {"Category": "", "Metric": "Data Format",
+             "Spark (⚡)": "JVM objects → Parquet",
+             "Rust (🦀)": "Rust structs → Arrow → Parquet", "Winner": "—"},
+
+            # ── Startup & JVM Overhead ──
+            {"Category": "🚀 Runtime Overhead", "Metric": "Runtime Model",
+             "Spark (⚡)": "JVM (HotSpot) + Python UDFs",
+             "Rust (🦀)": "Native binary (AOT compiled)", "Winner": "—"},
+            {"Category": "", "Metric": "Warm-up Required",
+             "Spark (⚡)": "Yes (JIT compilation)",
+             "Rust (🦀)": "No (pre-compiled)", "Winner": "🦀 Rust"},
+        ]
+
+        stats_df = pd.DataFrame(stats_rows)
+        st.dataframe(
+            stats_df,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Category": st.column_config.TextColumn(width="medium"),
+                "Metric": st.column_config.TextColumn(width="large"),
+                "Spark (⚡)": st.column_config.TextColumn(width="medium"),
+                "Rust (🦀)": st.column_config.TextColumn(width="medium"),
+                "Winner": st.column_config.TextColumn(width="small"),
+            },
+        )
+
+        # ── Batch Duration Overlay Chart ──────────────────
         rust_bd = rust.get("batch_durations_ms", [])
         spark_bd = spark.get("batch_durations_ms", [])
-        if rust_bd:
+        if rust_bd or spark_bd:
             st.markdown("##### Batch Duration Comparison (ms)")
-            max_len = max(len(spark_bd), len(rust_bd))
-            compare_df = pd.DataFrame({
-                "Spark": spark_bd + [None] * (max_len - len(spark_bd)),
-                "Rust": rust_bd + [None] * (max_len - len(rust_bd)),
-            })
-            st.line_chart(compare_df, use_container_width=True)
+            max_len = max(len(spark_bd), len(rust_bd)) if (spark_bd or rust_bd) else 0
+            chart_data = {}
+            if spark_bd:
+                chart_data["Spark"] = spark_bd + [None] * (max_len - len(spark_bd))
+            if rust_bd:
+                chart_data["Rust"] = rust_bd + [None] * (max_len - len(rust_bd))
+            if chart_data:
+                st.line_chart(pd.DataFrame(chart_data), width="stretch")
 
-        # Rust detailed batch table
-        rust_details = rust.get("batch_details", [])
-        if rust_details:
-            st.markdown("##### 🦀 Rust Per-Batch Breakdown")
-            rdf = pd.DataFrame(rust_details)
-            r_display = [c for c in ["batch_id", "rows", "wall_ms", "cpu_ms", "gc_ms",
-                                      "peak_memory_mb"] if c in rdf.columns]
-            if r_display:
-                st.dataframe(rdf[r_display], use_container_width=True, hide_index=True)
+        # ── Time breakdown stacked chart ──────────────────
+        if has_spark and has_rust:
+            st.markdown("##### ⏱️ Time Breakdown: Where Time Is Spent")
+            breakdown_data = {
+                "Stage": ["Kafka Read", "Transform (CPU)", "Delta Write", "GC Overhead"],
+                "Spark (ms)": [spark_s["total_kafka_ms"], spark_s["total_transform_ms"],
+                               spark_s["total_write_ms"], spark_s["total_gc_ms"]],
+                "Rust (ms)": [rust_s["total_kafka_ms"], rust_s["total_transform_ms"],
+                              rust_s["total_write_ms"], 0],
+            }
+            bd_df = pd.DataFrame(breakdown_data)
+            st.bar_chart(bd_df.set_index("Stage"), width="stretch")
+
+        # ── Per-Batch Detail Tables ───────────────────────
+        with st.expander("📋 Spark Per-Batch Details"):
+            batch_details = spark.get("batch_details", [])
+            if batch_details:
+                detail_df = pd.DataFrame(batch_details)
+                display_cols = [
+                    "batch_id", "rows", "wall_ms", "transform_ms", "write_ms",
+                    "cpu_ms", "gc_ms", "cpu_util_pct", "gc_pct",
+                    "shuffle_read_mb", "shuffle_write_mb", "peak_memory_mb", "tasks",
+                ]
+                available = [c for c in display_cols if c in detail_df.columns]
+                if available:
+                    st.dataframe(detail_df[available], width="stretch", hide_index=True)
+            else:
+                st.info("No Spark batch details available.")
+
+        with st.expander("📋 Rust Per-Batch Details"):
+            rust_details = rust.get("batch_details", [])
+            if rust_details:
+                rdf = pd.DataFrame(rust_details)
+                r_display = [c for c in ["batch_id", "rows", "wall_ms", "transform_ms", "write_ms",
+                                          "cpu_ms", "peak_memory_mb", "tasks"] if c in rdf.columns]
+                if r_display:
+                    st.dataframe(rdf[r_display], width="stretch", hide_index=True)
+            else:
+                st.info("No Rust batch details available.")
     else:
-        st.info("Run the Rust pipeline to see comparison metrics. "
-                "Start **Rust Streaming** on the Spark Jobs page.")
+        st.info("No runtime metrics yet. Start **Rust Streaming** or **Spark Streaming** "
+                "from the ⚙️ Spark Jobs page to collect performance data.")
 
     # Validation report
     if validation:
+        st.markdown("---")
         st.markdown("##### ✅ Validation Report")
         v1, v2, v3, v4 = st.columns(4)
         spark_rc = validation.get("spark_row_count", "—")
@@ -1383,7 +1805,7 @@ elif page == "📈 Performance":
                 {"Column": k, "Mismatches": v}
                 for k, v in validation["mismatch_columns"].items()
             ])
-            st.dataframe(mc_df, use_container_width=True, hide_index=True)
+            st.dataframe(mc_df, width="stretch", hide_index=True)
 
         with st.expander("📋 Raw Validation JSON"):
             st.json(validation)
@@ -1409,8 +1831,8 @@ elif page == "📈 Performance":
         ],
     }
     wf_df = pd.DataFrame(waterfall_data)
-    st.bar_chart(wf_df.set_index("Stage"), use_container_width=True)
-    st.dataframe(wf_df, use_container_width=True, hide_index=True)
+    st.bar_chart(wf_df.set_index("Stage"), width="stretch")
+    st.dataframe(wf_df, width="stretch", hide_index=True)
 
     # ── Raw Metrics JSON ──────────────────────────────────
     st.markdown("---")

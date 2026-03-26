@@ -8,7 +8,11 @@ use std::path::Path;
 pub fn ensure_parent_dir(path: &str) -> Result<()> {
     let p = Path::new(path);
     if !p.exists() {
-        std::fs::create_dir_all(p)?;
+        match std::fs::create_dir_all(p) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.into()),
+        }
     }
     Ok(())
 }

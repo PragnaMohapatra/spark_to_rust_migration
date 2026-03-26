@@ -5,11 +5,15 @@ services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.1
     container_name: zookeeper
+    restart: unless-stopped
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
     ports:
       - "2181:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
     healthcheck:
       test: ["CMD", "echo", "ruok", "|", "nc", "localhost", "2181"]
       interval: 10s
@@ -19,12 +23,15 @@ services:
   kafka:
     image: confluentinc/cp-kafka:7.6.1
     container_name: kafka
+    restart: unless-stopped
     depends_on:
       zookeeper:
         condition: service_healthy
     ports:
       - "9092:9092"
       - "29092:29092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
@@ -49,6 +56,7 @@ services:
   kafka-setup:
     image: confluentinc/cp-kafka:7.6.1
     container_name: kafka-setup
+    restart: on-failure
     depends_on:
       kafka:
         condition: service_healthy
@@ -74,7 +82,11 @@ services:
         --config max.message.bytes=10485760 \
         --config cleanup.policy=compact
 
-      echo 'Topics created successfully.'
+      echo 'Enforcing 7-day retention on all topics (survives restarts)...'
+      kafka-configs --bootstrap-server kafka:29092 --entity-type topics --entity-name financial_transactions --alter --add-config retention.ms=604800000,max.message.bytes=10485760
+      kafka-configs --bootstrap-server kafka:29092 --entity-type topics --entity-name account_updates --alter --add-config retention.ms=604800000,max.message.bytes=10485760,cleanup.policy=compact
+
+      echo 'Topics created/configured successfully.'
       kafka-topics --describe --bootstrap-server kafka:29092 --topic financial_transactions
       kafka-topics --describe --bootstrap-server kafka:29092 --topic account_updates
       "
@@ -83,6 +95,7 @@ services:
   spark-master:
     image: apache/spark:3.5.1
     container_name: spark-master
+    restart: unless-stopped
     user: root
     command: /opt/spark/sbin/start-master.sh
     environment:
@@ -107,6 +120,7 @@ services:
   spark-worker:
     image: apache/spark:3.5.1
     container_name: spark-worker
+    restart: unless-stopped
     user: root
     command: /opt/spark/sbin/start-worker.sh spark://spark-master:7077
     depends_on:
@@ -129,6 +143,7 @@ services:
       context: ./rust_pipeline
       dockerfile: Dockerfile
     container_name: rust-pipeline
+    restart: unless-stopped
     depends_on:
       kafka:
         condition: service_healthy
@@ -141,6 +156,33 @@ services:
       - RUST_LOG=info
     command: ["sleep", "infinity"]
 
+  # ---------- Dashboard ----------
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    container_name: dashboard
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./dashboard:/app/dashboard:ro
+      - ./config:/app/config:ro
+      - ./delta_output:/app/delta_output
+      - ./checkpoints:/app/checkpoints
+      - ./logs:/app/logs
+      - ./data_generator:/app/data_generator:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - STREAMLIT_SERVER_HEADLESS=true
+      - DASHBOARD_DOCKER=1
+      - SPARK_MASTER_HOST=spark-master
+    depends_on:
+      - kafka
+
 volumes:
   delta_output:
   checkpoints:
+  kafka_data:
+  zookeeper_data:
+  zookeeper_log:

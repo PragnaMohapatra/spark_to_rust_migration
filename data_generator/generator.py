@@ -11,6 +11,7 @@ Delta table can be upserted (MERGE) in near-real-time.
 """
 
 import hashlib
+import json
 import logging
 import random
 import sys
@@ -26,9 +27,11 @@ from faker import Faker
 from kafka import KafkaProducer
 from kafka.errors import KafkaError
 
-# Make dashboard importable from data_generator context
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from dashboard.metrics import update_generator_metrics, reset_metrics
+logger = logging.getLogger(__name__)
+
+# JSON sidecar for metrics (avoids DuckDB cross-process lock conflicts)
+_METRICS_DIR = Path(__file__).resolve().parent.parent / "logs"
+_GEN_JSON_PATH = _METRICS_DIR / "generator_metrics.json"
 
 from .schemas import (
     ACCOUNT_POOL,
@@ -169,6 +172,10 @@ class TransactionGenerator:
         self._records_sent = 0
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
+        self._batches_completed = 0
+        self._error_count = 0
+        self._batch_times_ms: list[float] = []
+        self._publish_latencies_ms: list[float] = []
 
     def _create_producer(self) -> KafkaProducer:
         return KafkaProducer(
@@ -236,11 +243,9 @@ class TransactionGenerator:
         publish_latency_ms = (time.perf_counter() - flush_start) * 1000
         batch_time_ms = (time.perf_counter() - batch_start) * 1000
 
-        # Emit instrumentation metrics
-        update_generator_metrics(
-            batch_time_ms=batch_time_ms,
-            publish_latency_ms=publish_latency_ms,
-        )
+        with self._lock:
+            self._batch_times_ms.append(batch_time_ms)
+            self._publish_latencies_ms.append(publish_latency_ms)
 
         return batch_bytes
 
@@ -261,18 +266,15 @@ class TransactionGenerator:
                     self._records_sent += self.batch_size
                     total = self._bytes_sent
                     total_records = self._records_sent
-                    total_batches = self._batches_completed = getattr(
-                        self, "_batches_completed", 0
-                    ) + 1
+                    self._batches_completed += 1
+                    total_batches = self._batches_completed
 
                 elapsed = time.time() - self._run_start_time
                 throughput = (total / 1e6) / elapsed if elapsed > 0 else 0
 
-                # Update shared metrics for dashboard
-                update_generator_metrics(
-                    bytes_sent=total,
-                    records_sent=total_records,
-                    batches_completed=total_batches,
+                # Write metrics to JSON sidecar (read by dashboard)
+                self._write_metrics_json(
+                    status="running",
                     elapsed_seconds=round(elapsed, 2),
                     throughput_mb_per_sec=round(throughput, 2),
                 )
@@ -289,7 +291,8 @@ class TransactionGenerator:
                 )
         except KafkaError as e:
             logger.error(f"[Thread-{thread_id}] Kafka error: {e}")
-            update_generator_metrics(errors=getattr(self, "_error_count", 0) + 1)
+            with self._lock:
+                self._error_count += 1
             raise
         finally:
             producer.close()
@@ -306,14 +309,11 @@ class TransactionGenerator:
         self._run_start_time = start_time
         self._batches_completed = 0
         self._error_count = 0
+        self._batch_times_ms = []
+        self._publish_latencies_ms = []
 
-        # Initialize metrics for this run
-        reset_metrics()
-        update_generator_metrics(
-            status="running",
-            start_time=start_time,
-            target_bytes=self.target_bytes,
-        )
+        # Write initial metrics
+        self._write_metrics_json(status="running")
 
         with ThreadPoolExecutor(max_workers=self.num_threads) as pool:
             futures = {
@@ -346,13 +346,43 @@ class TransactionGenerator:
             f"({throughput_mbps:.1f} MB/s)"
         )
 
-        # Final metrics update
-        update_generator_metrics(
+        # Final metrics
+        self._write_metrics_json(
             status="completed",
-            bytes_sent=self._bytes_sent,
-            records_sent=self._records_sent,
             elapsed_seconds=round(elapsed, 2),
             throughput_mb_per_sec=round(throughput_mbps, 2),
         )
 
         return summary
+
+    def _write_metrics_json(self, *, status: str = "running",
+                            elapsed_seconds: float = 0.0,
+                            throughput_mb_per_sec: float = 0.0):
+        """Atomically write generator metrics to a JSON sidecar file."""
+        bt = self._batch_times_ms[-200:]  # keep last 200
+        pl = self._publish_latencies_ms[-200:]
+        avg_bt = sum(bt) / len(bt) if bt else 0.0
+        avg_pl = sum(pl) / len(pl) if pl else 0.0
+        data = {
+            "status": status,
+            "start_time": self._run_start_time,
+            "target_bytes": self.target_bytes,
+            "bytes_sent": self._bytes_sent,
+            "records_sent": self._records_sent,
+            "batches_completed": self._batches_completed,
+            "elapsed_seconds": elapsed_seconds,
+            "throughput_mb_per_sec": throughput_mb_per_sec,
+            "avg_batch_time_ms": round(avg_bt, 2),
+            "avg_publish_latency_ms": round(avg_pl, 2),
+            "batch_timings_ms": bt,
+            "publish_latencies_ms": pl,
+            "errors": self._error_count,
+            "last_update": time.time(),
+        }
+        try:
+            _METRICS_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = _GEN_JSON_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            tmp.replace(_GEN_JSON_PATH)
+        except Exception:
+            pass  # best-effort; don't crash the generator
