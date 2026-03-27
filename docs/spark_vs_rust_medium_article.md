@@ -121,6 +121,337 @@ For each business transaction, the generator emits:
 
 That means the benchmark is not only measuring an append-heavy transaction stream. It is also exercising account-state maintenance through upsert semantics.
 
+## Transaction Schema: Raw Input
+
+Because the performance comparison is most meaningful on the transaction path, this section focuses only on the `financial_transactions` topic.
+
+The raw transaction event is produced by the Python generator in [data_generator/schemas.py](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/data_generator/schemas.py) and parsed by Spark using the explicit schema in [spark_jobs/streaming_job.py](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/spark_jobs/streaming_job.py). The Rust implementation deserializes the same JSON contract into `TransactionInput` in [rust_pipeline/src/schema.rs](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/rust_pipeline/src/schema.rs).
+
+The raw payload contains 27 business fields before Kafka metadata is attached:
+
+| Group | Fields |
+|---|---|
+| Identity | `transaction_id`, `timestamp` |
+| Account references | `sender_account_id`, `receiver_account_id`, `sender_account`, `receiver_account` |
+| Monetary fields | `amount`, `currency`, `fee`, `exchange_rate` |
+| Transaction classification | `transaction_type`, `status`, `category`, `channel` |
+| Parties | `sender_name`, `receiver_name`, `sender_bank_code`, `receiver_bank_code`, `sender_country`, `receiver_country` |
+| Traceability | `reference_id`, `session_id`, `device_fingerprint`, `ip_address` |
+| Risk and review | `risk_score`, `is_flagged` |
+| Free text | `memo` |
+
+A representative raw event looks like this:
+
+```json
+{
+  "transaction_id": "6c0b1f52-8f57-4d6c-a3f6-fdb5f327e2ab",
+  "timestamp": "2026-03-26T08:14:22Z",
+  "sender_account_id": "11111111-1111-1111-1111-111111111111",
+  "receiver_account_id": "22222222-2222-2222-2222-222222222222",
+  "sender_account": "4829103847561029",
+  "receiver_account": "6011449988776655",
+  "amount": 12499.50,
+  "currency": "USD",
+  "transaction_type": "WIRE",
+  "status": "COMPLETED",
+  "sender_name": "Alex Carter",
+  "receiver_name": "Priya Rao",
+  "sender_bank_code": "ABCD1234XYZ",
+  "receiver_bank_code": "WXYZ9876ABC",
+  "sender_country": "US",
+  "receiver_country": "GB",
+  "fee": 12.75,
+  "exchange_rate": 1.0,
+  "reference_id": "REF-20260326-001",
+  "memo": "Invoice settlement",
+  "risk_score": 0.74,
+  "is_flagged": false,
+  "category": "CORPORATE",
+  "channel": "API",
+  "ip_address": "192.168.10.25",
+  "device_fingerprint": "7f9a5c3db0f7b2cf3d64bc0f8d7c9e5a2f1d4c6b8a9e0f112233445566778899",
+  "session_id": "9d0e6f16-6aa8-4d47-9299-4f7bd9f51a1c"
+}
+```
+
+## Transaction Processing Stages
+
+Spark and Rust both apply the same seven transaction transformations in the same order. Spark chains them in [spark_jobs/transforms.py](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/spark_jobs/transforms.py), while Rust mirrors the same sequence in [rust_pipeline/src/transforms/mod.rs](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/rust_pipeline/src/transforms/mod.rs).
+
+The order is:
+
+1. Null handling
+2. Time dimensions
+3. Amount features
+4. Risk features
+5. Geo features
+6. Anonymization
+7. Session features
+
+That ordering matters because later stages depend on fields normalized earlier. For example, amount calculations rely on null-safe `fee` and `exchange_rate`, and geo features rely on null-safe country codes.
+
+## How the Transaction Fields Change
+
+### Step 1: Null handling
+
+This stage makes the event safe for downstream math and classification.
+
+Fields added:
+
+- `currency_safe`
+- `risk_score_safe`
+- `memo_clean`
+
+Fields normalized in place:
+
+- `fee` defaults to `0.0`
+- `exchange_rate` defaults to `1.0`
+- `sender_country` defaults to `XX`
+- `receiver_country` defaults to `XX`
+
+Logic:
+
+- `currency_safe = coalesce(currency, "USD")`
+- `risk_score_safe = coalesce(risk_score, 0.0)`
+- `memo_clean = trim(memo)` or `"(no memo)"`
+
+### Step 2: Time dimensions
+
+This stage converts a single timestamp into analytics and partitioning fields.
+
+Fields added:
+
+- `transaction_date`
+- `txn_year`
+- `txn_month`
+- `txn_day`
+- `txn_hour`
+- `txn_dayofweek`
+- `is_weekend`
+- `txn_quarter`
+- `date_str`
+
+Example:
+
+- Before: `timestamp = 2026-03-26T08:14:22Z`
+- After: `txn_year = 2026`, `txn_month = 3`, `txn_hour = 8`, `date_str = 2026-03-26`
+
+### Step 3: Amount features
+
+This stage turns the base monetary fields into features useful for monitoring and downstream analytics.
+
+Fields added:
+
+- `amount_bucket`
+- `net_amount`
+- `fee_pct`
+- `amount_usd`
+- `log_amount`
+
+Logic:
+
+- `amount_bucket` classifies each row as `MICRO`, `SMALL`, `MEDIUM`, `LARGE`, or `WHALE`
+- `net_amount = amount - fee`
+- `fee_pct = fee / amount * 100`
+- `amount_usd = amount * exchange_rate`
+- `log_amount = log(amount)` for positive amounts
+
+Example:
+
+- Before: `amount = 12499.50`, `fee = 12.75`, `exchange_rate = 1.0`
+- After: `amount_bucket = LARGE`, `net_amount = 12486.75`, `fee_pct ≈ 0.1020`, `amount_usd = 12499.50`
+
+### Step 4: Risk features
+
+This stage converts raw risk signals into discrete operational decisions.
+
+Fields added:
+
+- `risk_tier`
+- `risk_level`
+- `needs_review`
+
+Logic:
+
+- `risk_tier` maps the floating-point score into labels such as `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `NEGLIGIBLE`
+- `risk_level` converts the same score into an ordered integer scale
+- `needs_review = risk_score >= 0.7 or is_flagged or amount >= 100000`
+
+Example:
+
+- Before: `risk_score = 0.74`, `is_flagged = false`, `amount = 12499.50`
+- After: `risk_tier = HIGH`, `risk_level = 4`, `needs_review = true`
+
+### Step 5: Geo features
+
+This stage enriches the row with movement and corridor information.
+
+Fields added:
+
+- `is_cross_border`
+- `corridor`
+- `is_intra_bank`
+
+Logic:
+
+- `is_cross_border = sender_country != receiver_country`
+- `corridor = sender_country → receiver_country`
+- `is_intra_bank = sender_bank_code == receiver_bank_code`
+
+Example:
+
+- Before: `sender_country = US`, `receiver_country = GB`
+- After: `is_cross_border = true`, `corridor = US→GB`
+
+### Step 6: Anonymization
+
+This stage makes the final dataset safer for analytics by preserving utility while reducing direct exposure of sensitive data.
+
+Fields added:
+
+- `sender_hash`
+- `receiver_hash`
+- `sender_account_masked`
+- `receiver_account_masked`
+- `ip_anonymized`
+
+Logic:
+
+- Names are hashed with SHA-256
+- Account numbers are masked except for the last four digits
+- IP addresses have the last octet replaced
+
+Example:
+
+- Before: `sender_account = 4829103847561029`, `ip_address = 192.168.10.25`
+- After: `sender_account_masked = ************1029`, `ip_anonymized = 192.168.10.xxx`
+
+### Step 7: Session features
+
+This stage adds compact identifiers and convenience fields for user journey and fraud analysis.
+
+Fields added:
+
+- `device_short_id`
+- `session_prefix`
+- `memo_length`
+- `has_memo`
+- `row_id`
+
+Logic:
+
+- `device_short_id` takes the first 8 characters of the device fingerprint
+- `session_prefix` takes the first 8 characters of the session UUID
+- `memo_length` records the memo string length
+- `has_memo` becomes a boolean flag
+- `row_id` is a SHA-256 hash of `transaction_id`
+
+## Transaction Schema Evolution: Before and After
+
+The easiest way to think about the transformation chain is to separate fields into three categories.
+
+### Fields preserved from the raw transaction
+
+These survive into the final output with the same business meaning:
+
+- `transaction_id`
+- `timestamp`
+- `sender_account_id`
+- `receiver_account_id`
+- `sender_account`
+- `receiver_account`
+- `amount`
+- `currency`
+- `transaction_type`
+- `status`
+- `sender_name`
+- `receiver_name`
+- `sender_bank_code`
+- `receiver_bank_code`
+- `reference_id`
+- `memo`
+- `risk_score`
+- `is_flagged`
+- `category`
+- `channel`
+- `ip_address`
+- `device_fingerprint`
+- `session_id`
+
+### Fields normalized in the final output
+
+These are still the same business columns, but the final transaction output uses null-safe values:
+
+- `sender_country`
+- `receiver_country`
+- `fee`
+- `exchange_rate`
+
+### Fields added by the platform
+
+Beyond the raw payload, the final transaction table includes:
+
+- Kafka metadata: `kafka_key`, `topic`, `kafka_partition`, `kafka_offset`, `kafka_timestamp`
+- Null-safe helper columns: `currency_safe`, `risk_score_safe`, `memo_clean`
+- Time dimensions: `transaction_date`, `txn_year`, `txn_month`, `txn_day`, `txn_hour`, `txn_dayofweek`, `is_weekend`, `txn_quarter`, `date_str`
+- Amount features: `amount_bucket`, `net_amount`, `fee_pct`, `amount_usd`, `log_amount`
+- Risk features: `risk_tier`, `risk_level`, `needs_review`
+- Geo features: `is_cross_border`, `corridor`, `is_intra_bank`
+- Anonymized fields: `sender_hash`, `receiver_hash`, `sender_account_masked`, `receiver_account_masked`, `ip_anonymized`
+- Session features: `device_short_id`, `session_prefix`, `memo_length`, `has_memo`, `row_id`
+
+In other words, the final transaction output is not a replacement of the source event. It is the source event plus metadata, null-safe versions, analytical features, risk signals, and masked derivatives.
+
+## What the Final Transaction Record Looks Like
+
+The Rust `TransactionOutput` schema and the Spark write path converge on the same final table shape. A representative final record looks like this:
+
+```json
+{
+  "transaction_id": "6c0b1f52-8f57-4d6c-a3f6-fdb5f327e2ab",
+  "timestamp": "2026-03-26T08:14:22Z",
+  "amount": 12499.50,
+  "currency": "USD",
+  "fee": 12.75,
+  "exchange_rate": 1.0,
+  "sender_country": "US",
+  "receiver_country": "GB",
+  "topic": "financial_transactions",
+  "kafka_partition": 3,
+  "kafka_offset": 1450021,
+  "currency_safe": "USD",
+  "risk_score_safe": 0.74,
+  "memo_clean": "Invoice settlement",
+  "transaction_date": "2026-03-26",
+  "txn_year": 2026,
+  "txn_month": 3,
+  "txn_day": 26,
+  "txn_hour": 8,
+  "is_weekend": false,
+  "amount_bucket": "LARGE",
+  "net_amount": 12486.75,
+  "fee_pct": 0.1020,
+  "amount_usd": 12499.50,
+  "log_amount": 9.4334,
+  "risk_tier": "HIGH",
+  "risk_level": 4,
+  "needs_review": true,
+  "is_cross_border": true,
+  "corridor": "US→GB",
+  "is_intra_bank": false,
+  "sender_account_masked": "************1029",
+  "receiver_account_masked": "************6655",
+  "ip_anonymized": "192.168.10.xxx",
+  "device_short_id": "7f9a5c3d",
+  "session_prefix": "9d0e6f16",
+  "memo_length": 18,
+  "has_memo": true,
+  "row_id": "a4b1f8..."
+}
+```
+
+That final shape is why the transaction benchmark is interesting. It is not only comparing message ingestion. It is comparing two engines while they perform null normalization, time derivation, amount engineering, risk scoring, geo classification, anonymization, and session enrichment on every row before writing to Delta Lake.
+
 ## How to Build and Run the Pipelines
 
 The article would be incomplete without the actual run model. The following is the practical sequence.
