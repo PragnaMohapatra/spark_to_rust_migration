@@ -2,7 +2,7 @@
 
 When teams talk about replacing Spark with Rust, the conversation usually jumps straight to performance. That is understandable, but it is also incomplete. In practice, the harder question is not whether Rust can be faster. The harder question is whether a Rust pipeline can deliver a meaningful speedup while preserving the operational guardrails, recoverability, and observability that people already rely on in a Spark-based platform.
 
-This project was built to answer that question with a real streaming workload instead of a synthetic microbenchmark. The repository generates roughly 5 GB of synthetic financial transaction data, pushes it through Kafka, processes it with both Spark Structured Streaming and a Rust pipeline, and writes both outputs to Delta Lake. The benchmark report is captured in [pipeline_comparison_report.html](../pipeline_comparison_report.html), and the architecture used for this article is captured in [pipeline_architecture.pdf](./pipeline_architecture.pdf).
+This project was built to answer that question with a real streaming workload instead of a synthetic microbenchmark. The repository generates roughly 5 GB of synthetic financial transaction data, pushes it through Kafka, processes it with both Spark Structured Streaming and a Rust pipeline, and writes both outputs to Delta Lake. The benchmark report is captured in [pipeline_comparison_report.html](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/pipeline_comparison_report.html), and the architecture used for this article is captured in [pipeline_architecture.pdf](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/pipeline_architecture.pdf).
 
 If you want the public version of the project artifacts, they are available here:
 
@@ -15,7 +15,7 @@ If you want the public version of the project artifacts, they are available here
 
 For a quick visual preview of the benchmark output, see the screenshot here:
 
-![Spark vs Rust benchmark report screenshot](./pipeline_comparison_report.png)
+![Spark vs Rust benchmark report screenshot](https://raw.githubusercontent.com/PragnaMohapatra/spark_to_rust_migration/main/docs/pipeline_comparison_report.png)
 
 The result is not subtle: Rust wins decisively on latency and cumulative processing time for this workload. But Spark still provides real advantages in ecosystem maturity, operator familiarity, and SQL-native extensibility. The more useful conclusion is not "Spark bad, Rust good." The useful conclusion is where each engine pays for itself.
 
@@ -76,7 +76,7 @@ The environment is intentionally simple and reproducible.
 
 ### Infrastructure
 
-The core runtime is defined in [docker-compose.yml](../docker-compose.yml):
+The core runtime is defined in [docker-compose.yml](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docker-compose.yml):
 
 - `zookeeper`
 - `kafka`
@@ -95,7 +95,7 @@ The Rust pipeline runs in its own container, built from a multi-stage Dockerfile
 
 ### Shared configuration
 
-Most runtime decisions are centralized in [app_config.yaml](../config/app_config.yaml):
+Most runtime decisions are centralized in [app_config.yaml](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/config/app_config.yaml):
 
 - Kafka bootstrap servers and topic names
 - Generator target size, thread count, and batch size
@@ -148,7 +148,7 @@ That produces the full benchmark volume used in the final comparison.
 
 ### 3. Run the Spark transaction pipeline
 
-Spark can run locally, but the repo is structured primarily around the Dockerized cluster path. The startup script in [start_pipeline.sh](../scripts/start_pipeline.sh) uses `spark-submit` from the master container:
+Spark can run locally, but the repo is structured primarily around the Dockerized cluster path. The startup script in [start_pipeline.sh](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/scripts/start_pipeline.sh) uses `spark-submit` from the master container:
 
 ```powershell
 docker exec spark-master spark-submit \
@@ -172,7 +172,7 @@ Spark uses a `10 seconds` trigger interval and `500000` max offsets per trigger 
 
 ### 4. Build the Rust pipeline
 
-The Rust implementation is defined in [rust_pipeline/Dockerfile](../rust_pipeline/Dockerfile) and [rust_pipeline/Cargo.toml](../rust_pipeline/Cargo.toml).
+The Rust implementation is defined in [rust_pipeline/Dockerfile](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/rust_pipeline/Dockerfile) and [rust_pipeline/Cargo.toml](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/rust_pipeline/Cargo.toml).
 
 The Dockerfile uses a multi-stage build:
 
@@ -195,7 +195,7 @@ Those choices are exactly what you want in a benchmarking context: optimized bui
 
 ### 5. Run the Rust transaction and account pipelines
 
-The Rust CLI in [rust_pipeline/src/main.rs](../rust_pipeline/src/main.rs) exposes three commands: `stream`, `upsert`, and `validate`.
+The Rust CLI in [rust_pipeline/src/main.rs](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/rust_pipeline/src/main.rs) exposes three commands: `stream`, `upsert`, and `validate`.
 
 Run the transaction stream:
 
@@ -333,13 +333,13 @@ That makes Rust a serious candidate for targeted high-throughput, low-latency da
 
 ## Source Artifacts
 
-- Benchmark report: [pipeline_comparison_report.html](../pipeline_comparison_report.html)
-- Architecture export: [pipeline_architecture.pdf](./pipeline_architecture.pdf)
-- Draw.io source: [pipeline_architecture.drawio](./pipeline_architecture.drawio)
-- Runtime definition: [docker-compose.yml](../docker-compose.yml)
-- Shared config: [app_config.yaml](../config/app_config.yaml)
-- Spark startup flow: [start_pipeline.sh](../scripts/start_pipeline.sh)
-- Rust entry point: [main.rs](../rust_pipeline/src/main.rs)
+- Benchmark report: [pipeline_comparison_report.html](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/pipeline_comparison_report.html)
+- Architecture export: [pipeline_architecture.pdf](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/pipeline_architecture.pdf)
+- Draw.io source: [pipeline_architecture.drawio](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/pipeline_architecture.drawio)
+- Runtime definition: [docker-compose.yml](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docker-compose.yml)
+- Shared config: [app_config.yaml](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/config/app_config.yaml)
+- Spark startup flow: [start_pipeline.sh](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/scripts/start_pipeline.sh)
+- Rust entry point: [main.rs](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/rust_pipeline/src/main.rs)
 
 ## Public Links
 
