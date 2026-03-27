@@ -561,6 +561,38 @@ This is where the project is stronger than a one-off benchmark. It is not only a
 
 The dashboard is the operator surface. It provides a place to start and stop jobs, inspect output, and review benchmark status. In migration work, that matters because engineers need a shared control surface while two implementations coexist.
 
+The current dashboard views are shown below so the control-plane surface is documented alongside the benchmark narrative.
+
+#### Dashboard overview
+
+[Open dashboard overview screenshot](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/dashboard_overview.png)
+
+[![Dashboard overview](https://raw.githubusercontent.com/PragnaMohapatra/spark_to_rust_migration/main/docs/dashboard_overview.png)](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/dashboard_overview.png)
+
+#### Data generator
+
+[Open data generator screenshot](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/dashboard_data_generator.png)
+
+[![Data generator page](https://raw.githubusercontent.com/PragnaMohapatra/spark_to_rust_migration/main/docs/dashboard_data_generator.png)](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/dashboard_data_generator.png)
+
+#### Spark jobs
+
+[Open Spark jobs screenshot](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/dashboard_spark_jobs.png)
+
+[![Spark jobs page](https://raw.githubusercontent.com/PragnaMohapatra/spark_to_rust_migration/main/docs/dashboard_spark_jobs.png)](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/dashboard_spark_jobs.png)
+
+#### Delta explorer
+
+[Open Delta explorer screenshot](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/dashboard_delta_explorer.png)
+
+[![Delta explorer page](https://raw.githubusercontent.com/PragnaMohapatra/spark_to_rust_migration/main/docs/dashboard_delta_explorer.png)](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/dashboard_delta_explorer.png)
+
+#### Performance analytics
+
+[Open performance analytics screenshot](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/dashboard_performance.png)
+
+[![Performance analytics page](https://raw.githubusercontent.com/PragnaMohapatra/spark_to_rust_migration/main/docs/dashboard_performance.png)](https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/dashboard_performance.png)
+
 ### 2. Metrics as first-class outputs
 
 The control plane persists metrics files for:
@@ -677,6 +709,11 @@ That makes Rust a serious candidate for targeted high-throughput, low-latency da
 - Repository: https://github.com/PragnaMohapatra/spark_to_rust_migration
 - HTML benchmark report: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/pipeline_comparison_report.html
 - Benchmark report screenshot: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/pipeline_comparison_report.png
+- Dashboard overview screenshot: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/dashboard_overview.png
+- Dashboard data generator screenshot: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/dashboard_data_generator.png
+- Dashboard Spark jobs screenshot: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/dashboard_spark_jobs.png
+- Dashboard Delta explorer screenshot: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/dashboard_delta_explorer.png
+- Dashboard performance screenshot: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/dashboard_performance.png
 - Architecture PDF: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/pipeline_architecture.pdf
 - Architecture draw.io: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/pipeline_architecture.drawio
 - Article markdown: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/spark_vs_rust_medium_article.md
