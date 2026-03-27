@@ -434,8 +434,13 @@ elif page == "⚙️ Spark Jobs":
         """Start a Spark job inside the Docker Spark container via spark-submit."""
         _ensure_container_deps()
         container_script = CONTAINER_SCRIPT_MAP.get(name, f"/opt/spark-jobs/{Path(script).name}")
+        metrics_filename = {
+            "streaming": "spark_stream_metrics.json",
+            "account_upsert": "spark_account_metrics.json",
+        }.get(name, "spark_metrics.json")
+        max_cores_per_app = str(cfg.get("spark", {}).get("max_cores_per_app", cfg.get("spark", {}).get("worker_cores", 4)))
         cmd = [
-            "docker", "exec", "spark-master",
+            "docker", "exec", "-e", f"SPARK_METRICS_FILENAME={metrics_filename}", "spark-master",
             "/opt/spark/bin/spark-submit",
             "--jars", ",".join([
                 "/opt/extra-jars/spark-sql-kafka-0-10_2.12-3.5.1.jar",
@@ -447,6 +452,7 @@ elif page == "⚙️ Spark Jobs":
             ]),
             "--conf", "spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension",
             "--conf", "spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog",
+            "--conf", f"spark.cores.max={max_cores_per_app}",
             container_script,
             "--config", "/opt/config/app_config.yaml",
         ]
@@ -729,34 +735,52 @@ elif page == "⚙️ Spark Jobs":
     st.subheader("📊 Live Pipeline Metrics")
 
     _jobs_metrics = get_metrics()
-    _spark_m = _jobs_metrics["spark"]
-    _rust_m = _jobs_metrics.get("rust", {})
+    _spark_stream_m = _jobs_metrics.get("spark_stream", _jobs_metrics["spark"])
+    _spark_account_m = _jobs_metrics.get("spark_account", {})
+    _rust_stream_m = _jobs_metrics.get("rust_stream", _jobs_metrics.get("rust", {}))
+    _rust_account_m = _jobs_metrics.get("rust_account", {})
 
     _any_job_running = any(
         _check_proc(k) == "running"
         for k in list(SPARK_JOBS.keys()) + list(RUST_JOBS.keys())
     )
 
-    if _spark_m.get("micro_batches_completed", 0) > 0 or _rust_m.get("micro_batches_completed", 0) > 0:
+    if any(m.get("micro_batches_completed", 0) > 0 for m in [_spark_stream_m, _spark_account_m, _rust_stream_m, _rust_account_m]):
         col_s, col_r = st.columns(2)
         with col_s:
-            st.markdown("**⚡ Spark Pipeline**")
-            s_status = _spark_m.get("status", "idle")
+            st.markdown("**⚡ Spark Streaming**")
+            s_status = _spark_stream_m.get("status", "idle")
             s_icon = {"running": "🟢", "idle": "⚪", "completed": "✅"}.get(s_status, "🔴")
             st.write(f"Status: {s_icon} **{s_status.upper()}**")
             ss1, ss2, ss3 = st.columns(3)
-            ss1.metric("Batches", f"{_spark_m['micro_batches_completed']:,}")
-            ss2.metric("Rows", f"{_spark_m['total_rows_processed']:,}")
-            ss3.metric("Avg Batch", f"{_spark_m['avg_batch_duration_ms']:.0f} ms")
+            ss1.metric("Batches", f"{_spark_stream_m['micro_batches_completed']:,}")
+            ss2.metric("Rows", f"{_spark_stream_m['total_rows_processed']:,}")
+            ss3.metric("Avg Batch", f"{_spark_stream_m['avg_batch_duration_ms']:.0f} ms")
         with col_r:
-            st.markdown("**🦀 Rust Pipeline**")
-            r_status = _rust_m.get("status", "idle")
+            st.markdown("**🦀 Rust Streaming**")
+            r_status = _rust_stream_m.get("status", "idle")
             r_icon = {"running": "🟢", "idle": "⚪", "completed": "✅"}.get(r_status, "🔴")
             st.write(f"Status: {r_icon} **{r_status.upper()}**")
             rr1, rr2, rr3 = st.columns(3)
-            rr1.metric("Batches", f"{_rust_m.get('micro_batches_completed', 0):,}")
-            rr2.metric("Rows", f"{_rust_m.get('total_rows_processed', 0):,}")
-            rr3.metric("Avg Batch", f"{_rust_m.get('avg_batch_duration_ms', 0):.0f} ms")
+            rr1.metric("Batches", f"{_rust_stream_m.get('micro_batches_completed', 0):,}")
+            rr2.metric("Rows", f"{_rust_stream_m.get('total_rows_processed', 0):,}")
+            rr3.metric("Avg Batch", f"{_rust_stream_m.get('avg_batch_duration_ms', 0):.0f} ms")
+
+        if _spark_account_m.get("micro_batches_completed", 0) > 0 or _rust_account_m.get("micro_batches_completed", 0) > 0:
+            st.markdown("##### 👤 Account Upsert Metrics")
+            col_sa, col_ra = st.columns(2)
+            with col_sa:
+                st.markdown("**⚡ Spark Account Upsert**")
+                sa1, sa2, sa3 = st.columns(3)
+                sa1.metric("Batches", f"{_spark_account_m.get('micro_batches_completed', 0):,}")
+                sa2.metric("Rows", f"{_spark_account_m.get('total_rows_processed', 0):,}")
+                sa3.metric("Avg Batch", f"{_spark_account_m.get('avg_batch_duration_ms', 0):.0f} ms")
+            with col_ra:
+                st.markdown("**🦀 Rust Account Upsert**")
+                ra1, ra2, ra3 = st.columns(3)
+                ra1.metric("Batches", f"{_rust_account_m.get('micro_batches_completed', 0):,}")
+                ra2.metric("Rows", f"{_rust_account_m.get('total_rows_processed', 0):,}")
+                ra3.metric("Avg Batch", f"{_rust_account_m.get('avg_batch_duration_ms', 0):.0f} ms")
     elif _any_job_running:
         st.info("Pipeline jobs are running — metrics will appear after the first batch completes.")
     else:
@@ -1072,8 +1096,8 @@ elif page == "📈 Performance":
 
     metrics = get_metrics()
     gen = metrics["generator"]
-    spark = metrics["spark"]
-    rust = metrics.get("rust", {})
+    spark = metrics.get("spark_stream", metrics["spark"])
+    rust = metrics.get("rust_stream", metrics.get("rust", {}))
 
     # ── Quick Spark vs Rust Summary (always visible at top) ──
     _rs = rust.get("micro_batches_completed", 0)

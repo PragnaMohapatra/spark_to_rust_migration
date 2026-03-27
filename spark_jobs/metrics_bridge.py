@@ -2,12 +2,16 @@
 Lightweight JSON-file metrics bridge for Spark jobs running inside Docker.
 
 DuckDB cannot be shared across process boundaries (host Streamlit ↔ container
-Spark) due to exclusive file locking.  This module writes a simple JSON file
-to the shared ``/opt/logs`` volume.  The Streamlit dashboard polls this file
-and merges the data into its own DuckDB instance on the host side.
+Spark) due to exclusive file locking. This module writes a simple JSON file
+to the shared ``/opt/logs`` volume. The Streamlit dashboard polls these files
+and merges the data into its own host-side view.
 
-File: ``logs/spark_metrics.json``   (host)
-      ``/opt/logs/spark_metrics.json`` (container)
+Default file:
+    ``logs/spark_metrics.json``   (host)
+    ``/opt/logs/spark_metrics.json`` (container)
+
+Job-specific overrides are supported via ``SPARK_METRICS_FILENAME`` so
+streaming and account-upsert jobs do not overwrite each other.
 """
 
 import json
@@ -21,17 +25,23 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 _METRICS_DIR = Path(__file__).resolve().parent.parent / "logs"
-_METRICS_FILE = _METRICS_DIR / "spark_metrics.json"
+_DEFAULT_METRICS_FILENAME = "spark_metrics.json"
 
 # Rolling window size for per-batch timings
 _MAX_TIMINGS = 200
 
 
+def _metrics_file() -> Path:
+    filename = os.environ.get("SPARK_METRICS_FILENAME", _DEFAULT_METRICS_FILENAME)
+    return _METRICS_DIR / filename
+
+
 def _load() -> dict:
     """Load current metrics from the JSON file, or return defaults."""
     try:
-        if _METRICS_FILE.exists():
-            return json.loads(_METRICS_FILE.read_text(encoding="utf-8"))
+        metrics_file = _metrics_file()
+        if metrics_file.exists():
+            return json.loads(metrics_file.read_text(encoding="utf-8"))
     except Exception:
         pass
     return {
@@ -54,12 +64,13 @@ def _load() -> dict:
 def _save(data: dict):
     """Atomically write metrics JSON (write-to-temp then rename)."""
     _METRICS_DIR.mkdir(parents=True, exist_ok=True)
+    metrics_file = _metrics_file()
     fd, tmp = tempfile.mkstemp(dir=str(_METRICS_DIR), suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f)
         # Atomic rename (works on Linux; on Windows it replaces)
-        os.replace(tmp, str(_METRICS_FILE))
+        os.replace(tmp, str(metrics_file))
     except Exception:
         try:
             os.unlink(tmp)

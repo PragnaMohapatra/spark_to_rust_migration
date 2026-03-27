@@ -138,6 +138,27 @@ services:
       - ./logs:/opt/logs
       - ./jars:/opt/extra-jars
 
+  spark-worker-2:
+    image: apache/spark:3.5.1
+    container_name: spark-worker-2
+    restart: unless-stopped
+    user: root
+    command: /opt/spark/sbin/start-worker.sh spark://spark-master:7077
+    depends_on:
+      - spark-master
+    environment:
+      SPARK_WORKER_MEMORY: 4g
+      SPARK_WORKER_CORES: 4
+      SPARK_NO_DAEMONIZE: "true"
+    volumes:
+      - ./spark_jobs:/opt/spark-jobs
+      - ./config:/opt/config
+      - ./delta_output:/opt/delta_output
+      - ./checkpoints:/opt/checkpoints
+      - ./dashboard:/opt/dashboard
+      - ./logs:/opt/logs
+      - ./jars:/opt/extra-jars
+
   rust-pipeline:
     build:
       context: ./rust_pipeline
