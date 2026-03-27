@@ -8,9 +8,14 @@ If you want the public version of the project artifacts, they are available here
 
 - Public repository: https://github.com/PragnaMohapatra/spark_to_rust_migration
 - Public benchmark report: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/pipeline_comparison_report.html
+- Public report screenshot: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/pipeline_comparison_report.png
 - Public architecture PDF: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/pipeline_architecture.pdf
 - Public draw.io source: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/pipeline_architecture.drawio
 - Public article source: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/spark_vs_rust_medium_article.md
+
+For a quick visual preview of the benchmark output, see the screenshot here:
+
+![Spark vs Rust benchmark report screenshot](./pipeline_comparison_report.png)
 
 The result is not subtle: Rust wins decisively on latency and cumulative processing time for this workload. But Spark still provides real advantages in ecosystem maturity, operator familiarity, and SQL-native extensibility. The more useful conclusion is not "Spark bad, Rust good." The useful conclusion is where each engine pays for itself.
 
@@ -340,6 +345,7 @@ That makes Rust a serious candidate for targeted high-throughput, low-latency da
 
 - Repository: https://github.com/PragnaMohapatra/spark_to_rust_migration
 - HTML benchmark report: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/pipeline_comparison_report.html
+- Benchmark report screenshot: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/pipeline_comparison_report.png
 - Architecture PDF: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/pipeline_architecture.pdf
 - Architecture draw.io: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/pipeline_architecture.drawio
 - Article markdown: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/spark_vs_rust_medium_article.md
