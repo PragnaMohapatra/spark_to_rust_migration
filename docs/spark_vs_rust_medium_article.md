@@ -4,6 +4,14 @@ When teams talk about replacing Spark with Rust, the conversation usually jumps 
 
 This project was built to answer that question with a real streaming workload instead of a synthetic microbenchmark. The repository generates roughly 5 GB of synthetic financial transaction data, pushes it through Kafka, processes it with both Spark Structured Streaming and a Rust pipeline, and writes both outputs to Delta Lake. The benchmark report is captured in [pipeline_comparison_report.html](../pipeline_comparison_report.html), and the architecture used for this article is captured in [pipeline_architecture.pdf](./pipeline_architecture.pdf).
 
+If you want the public version of the project artifacts, they are available here:
+
+- Public repository: https://github.com/PragnaMohapatra/spark_to_rust_migration
+- Public benchmark report: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/pipeline_comparison_report.html
+- Public architecture PDF: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/pipeline_architecture.pdf
+- Public draw.io source: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/pipeline_architecture.drawio
+- Public article source: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/spark_vs_rust_medium_article.md
+
 The result is not subtle: Rust wins decisively on latency and cumulative processing time for this workload. But Spark still provides real advantages in ecosystem maturity, operator familiarity, and SQL-native extensibility. The more useful conclusion is not "Spark bad, Rust good." The useful conclusion is where each engine pays for itself.
 
 ## The Benchmark in One View
@@ -327,3 +335,11 @@ That makes Rust a serious candidate for targeted high-throughput, low-latency da
 - Shared config: [app_config.yaml](../config/app_config.yaml)
 - Spark startup flow: [start_pipeline.sh](../scripts/start_pipeline.sh)
 - Rust entry point: [main.rs](../rust_pipeline/src/main.rs)
+
+## Public Links
+
+- Repository: https://github.com/PragnaMohapatra/spark_to_rust_migration
+- HTML benchmark report: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/pipeline_comparison_report.html
+- Architecture PDF: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/pipeline_architecture.pdf
+- Architecture draw.io: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/pipeline_architecture.drawio
+- Article markdown: https://github.com/PragnaMohapatra/spark_to_rust_migration/blob/main/docs/spark_vs_rust_medium_article.md
